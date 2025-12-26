@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <title>Alina Voice Assistant · Demo</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #0f172a;
+            color: #e5e7eb;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 900px;
+            padding: 24px;
+        }
+
+        h1 {
+            margin-top: 0;
+            font-size: 24px;
+        }
+
+        .card {
+            background: #020617;
+            border-radius: 16px;
+            padding: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            border: 1px solid #1e293b;
+        }
+
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        button {
+            padding: 10px 18px;
+            border-radius: 999px;
+            border: none;
+            font-size: 14px;
+            cursor: pointer;
+            background: #22c55e;
+            color: #020617;
+            font-weight: 600;
+            transition: background 0.15s ease, transform 0.05s ease;
+        }
+
+        button.secondary {
+            background: #1f2937;
+            color: #e5e7eb;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: default;
+        }
+
+        button:not(:disabled):hover {
+            background: #16a34a;
+            transform: translateY(-1px);
+        }
+
+        .status {
+            font-size: 13px;
+            color: #9ca3af;
+        }
+
+        .chat {
+            max-height: 320px;
+            overflow-y: auto;
+            margin-top: 16px;
+            padding-right: 4px;
+        }
+
+        .msg {
+            margin-bottom: 12px;
+        }
+
+        .msg-user {
+            text-align: right;
+        }
+
+        .bubble {
+            display: inline-block;
+            padding: 8px 12px;
+            border-radius: 16px;
+            max-width: 80%;
+            word-wrap: break-word;
+            font-size: 14px;
+        }
+
+        .bubble-user {
+            background: #22c55e;
+            color: #022c22;
+            border-bottom-right-radius: 4px;
+        }
+
+        .bubble-bot {
+            background: #0b1120;
+            border: 1px solid #1e293b;
+            color: #e5e7eb;
+            border-bottom-left-radius: 4px;
+        }
+
+        .audio-box {
+            margin-top: 16px;
+            padding-top: 12px;
+            border-top: 1px solid #1e293b;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        audio {
+            width: 100%;
+        }
+
+        .error {
+            margin-top: 8px;
+            font-size: 13px;
+            color: #f97373;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Alina Voice Assistant · Demo</h1>
+    <div class="card">
+        <div class="controls">
+            <button id="recordBtn">🎙 Начать запись</button>
+            <button id="stopBtn" class="secondary" disabled>⏹ Остановить</button>
+            <span class="status" id="statusLabel">Готова к записи</span>
+        </div>
+
+        <div class="chat" id="chatLog"></div>
+
+        <div class="audio-box">
+            <button id="playBtn" class="secondary" disabled>▶ Проиграть ответ</button>
+            <audio id="answerAudio" controls></audio>
+        </div>
+
+        <div id="errorBox" class="error"></div>
+    </div>
+</div>
+
+<script>
+    const API_URL = "http://127.0.0.1:8001/alina/voice";
+
+    const recordBtn = document.getElementById("recordBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const playBtn = document.getElementById("playBtn");
+    const statusLabel = document.getElementById("statusLabel");
+    const chatLog = document.getElementById("chatLog");
+    const errorBox = document.getElementById("errorBox");
+    const answerAudio = document.getElementById("answerAudio");
+
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let lastAnswerAudioURL = null;
+
+    function setStatus(text) {
+        statusLabel.textContent = text;
+    }
+
+    function setError(text) {
+        errorBox.textContent = text || "";
+    }
+
+    function addMessage(role, text) {
+        const msg = document.createElement("div");
+        msg.className = "msg " + (role === "user" ? "msg-user" : "msg-bot");
+
+        const bubble = document.createElement("div");
+        bubble.className = "bubble " + (role === "user" ? "bubble-user" : "bubble-bot");
+        bubble.textContent = text;
+
+        msg.appendChild(bubble);
+        chatLog.appendChild(msg);
+        chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    async function startRecording() {
+        setError("");
+
+        try {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                setError("Браузер не поддерживает запись с микрофона.");
+                return;
+            }
+
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            audioChunks = [];
+
+            mediaRecorder = new MediaRecorder(stream);
+
+            mediaRecorder.ondataavailable = (event) => {
+                if (event.data.size > 0) {
+                    audioChunks.push(event.data);
+                }
+            };
+
+            mediaRecorder.onstop = async () => {
+                setStatus("Обработка записи...");
+                recordBtn.disabled = false;
+                stopBtn.disabled = true;
+
+                const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || "audio/webm" });
+                await sendAudioToServer(blob);
+            };
+
+            mediaRecorder.start();
+            setStatus("Запись... говорите");
+            recordBtn.disabled = true;
+            stopBtn.disabled = false;
+        } catch (e) {
+            console.error(e);
+            setError("Ошибка доступа к микрофону: " + e.message);
+        }
+    }
+
+    function stopRecording() {
+        if (mediaRecorder && mediaRecorder.state === "recording") {
+            mediaRecorder.stop();
+            setStatus("Останавливаем запись...");
+        }
+    }
+
+    async function sendAudioToServer(blob) {
+        try {
+            setError("");
+            setStatus("Отправляем аудио Алине...");
+
+            const formData = new FormData();
+            // имя поля ДОЛЖНО быть "audio" — так ждёт FastAPI
+            formData.append("audio", blob, "input.webm");
+
+            const response = await fetch(API_URL, {
+                method: "POST",
+                body: formData,
+            });
+
+            if (!response.ok) {
+                const text = await response.text();
+                throw new Error("Ошибка сервера: " + response.status + " " + text);
+            }
+
+            const data = await response.json();
+
+            const transcript = data.transcript || "(распознавание не дало текста)";
+            const answer = data.answer || "(нет ответа)";
+
+            addMessage("user", transcript);
+            addMessage("bot", answer);
+
+            if (data.audio_base64) {
+                const mime = data.audio_mime || "audio/mpeg";
+                const audioBlob = base64ToBlob(data.audio_base64, mime);
+
+                if (lastAnswerAudioURL) {
+                    URL.revokeObjectURL(lastAnswerAudioURL);
+                }
+
+                lastAnswerAudioURL = URL.createObjectURL(audioBlob);
+                answerAudio.src = lastAnswerAudioURL;
+                playBtn.disabled = false;
+            } else {
+                playBtn.disabled = true;
+                answerAudio.removeAttribute("src");
+            }
+
+            setStatus("Готово. Можно записывать новый запрос.");
+        } catch (e) {
+            console.error(e);
+            setError(e.message || "Ошибка при запросе к Алине");
+            setStatus("Ошибка");
+        }
+    }
+
+    function base64ToBlob(base64, mimeType) {
+        const byteChars = atob(base64);
+        const byteNumbers = new Array(byteChars.length);
+
+        for (let i = 0; i < byteChars.length; i++) {
+            byteNumbers[i] = byteChars.charCodeAt(i);
+        }
+
+        const byteArray = new Uint8Array(byteNumbers);
+        return new Blob([byteArray], { type: mimeType });
+    }
+
+    recordBtn.addEventListener("click", startRecording);
+    stopBtn.addEventListener("click", stopRecording);
+    playBtn.addEventListener("click", () => {
+        if (answerAudio.src) {
+            answerAudio.play().catch((e) => {
+                console.error(e);
+                setError("Не удалось проиграть аудио: " + e.message);
+            });
+        }
+    });
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+# Python / IDE
+.venv/
+.idea/
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+API Keys/
+
+# Media / artifacts
+*.mp3
+*.wav
+*.json
