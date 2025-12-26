@@ -1,208 +1,161 @@
-# backend/assistant/alina.py
+# backend/alina_server.py
 
 from __future__ import annotations
 
-import base64
-import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+import uuid
+from typing import Dict
 
-from assistant.stt_client import transcribe
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
-# LLM: у тебя может быть либо chat_with_alina (non-stream),
-# либо streaming-обёртка (если ты её добавлял позже).
-try:
-    from assistant.llm_client import chat_with_alina  # type: ignore
-except Exception as e:
-    raise RuntimeError(f"Failed to import chat_with_alina from assistant.llm_client: {e}")
+from assistant.alina import AlinaAssistant
+from assistant.llm_client import CancelToken
 
-# TTS: у тебя в проекте встречается elevenlabs_client.py (в assistant/)
-# Если файл лежит именно в backend/assistant/elevenlabs_client.py — импорт как ниже корректный.
-try:
-    from assistant.elevenlabs_client import tts_elevenlabs  # type: ignore
-except Exception as e:
-    raise RuntimeError(f"Failed to import tts_elevenlabs from assistant.elevenlabs_client: {e}")
+app = FastAPI(
+    title="Alina Voice Assistant",
+    version="1.2.0",
+    description="STT → LLM → TTS (RU / EN / TH)",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Assistants ---
+assistant_ru = AlinaAssistant(mode="ru")
+assistant_en = AlinaAssistant(mode="en")
+assistant_th = AlinaAssistant(mode="th")
+
+active_cancels: Dict[str, CancelToken] = {}
 
 
-@dataclass
-class AssistantConfig:
-    mode: str = "ru"  # ru|en|th
-    model: str = "gpt-4o-mini"
-    temperature: float = 0.4
-    max_history_messages: int = 12  # сколько последних реплик хранить (user+assistant)
+# ---------- Health ----------
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "alina"}
 
 
-def _system_prompt(mode: str) -> str:
-    # Короткий, “дешёвый” промпт — меньше токенов = быстрее и дешевле.
-    if mode == "en":
-        return (
-            "You are Alina, a concise, helpful voice assistant. "
-            "Respond clearly, with short paragraphs and actionable steps. "
-            "If the user asks about Thailand/Phuket, answer with practical local advice."
+# ---------- Cancel ----------
+@app.post("/alina/cancel")
+async def alina_cancel(session_id: str = Form(...)):
+    tok = active_cancels.get(session_id)
+    if tok:
+        tok.cancel()
+        return {"status": "cancelled"}
+    return {"status": "not_found"}
+
+
+# ---------- Voice ----------
+@app.post("/alina/voice")
+async def alina_voice(
+    audio: UploadFile = File(...),
+    lang: str = Form("ru"),
+    session_id: str = Form(""),
+):
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(400, "Empty audio")
+
+    if not session_id:
+        session_id = str(uuid.uuid4())
+
+    assistant = {
+        "ru": assistant_ru,
+        "en": assistant_en,
+        "th": assistant_th,
+    }.get(lang, assistant_ru)
+
+    cancel_token = CancelToken(False)
+    active_cancels[session_id] = cancel_token
+
+    try:
+        result = assistant.handle_user_audio(
+            audio_bytes,
+            audio.filename or "audio.wav",
+            cancel_token=cancel_token,
+            use_llm_stream=True,
         )
-    if mode == "th":
-        # UI/режим тайский: отвечаем по-тайски, если возможно.
-        return (
-            "คุณคือ Alina ผู้ช่วยเสียงที่ตอบสั้น กระชับ และเป็นประโยชน์. "
-            "ตอบเป็นภาษาไทย หากผู้ใช้พูดภาษาไทย. "
-            "หากผู้ใช้ถามเรื่องประเทศไทย/ภูเก็ต ให้คำแนะนำที่ใช้ได้จริง."
-        )
-    # ru
-    return (
-        "Ты — Алина, голосовой ассистент. Отвечай кратко, по делу, структурировано. "
-        "Если вопрос про Таиланд/Пхукет — давай практичные рекомендации."
-    )
+        result["session_id"] = session_id
+        return result
+    finally:
+        active_cancels.pop(session_id, None)
 
 
-def _trim_history(history: List[Dict[str, str]], max_messages: int) -> List[Dict[str, str]]:
-    """
-    Оставляем последние max_messages сообщений истории (без system),
-    чтобы не раздувать контекст (и latency).
-    """
-    if max_messages <= 0:
-        return []
-    return history[-max_messages:]
+# ---------- UI ----------
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTMLResponse("""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Alina – Voice Assistant</title>
+<style>
+body { font-family: system-ui; background:#f5f6f7; padding:20px }
+.card { background:#fff; padding:20px; border-radius:12px; margin-bottom:20px }
+.btn { padding:8px 16px; border-radius:8px; border:1px solid #ccc; cursor:pointer }
+.btn-primary { background:#2563eb; color:#fff; border:none }
+</style>
+</head>
+<body>
+
+<h1>Alina – голосовой ассистент</h1>
+<p>STT → LLM → TTS (RU / EN / TH)</p>
+
+<div class="card">
+  <h3>Шаг 1</h3>
+  <input type="file" id="audio" accept="audio/*" />
+</div>
+
+<div class="card">
+  <h3>Шаг 2</h3>
+
+  <label><input type="radio" name="lang" value="ru" checked> 🇷🇺 RU</label>
+  <label><input type="radio" name="lang" value="en"> 🇬🇧 EN</label>
+  <label><input type="radio" name="lang" value="th"> 🇹🇭 TH</label>
+
+  <br><br>
+  <button class="btn btn-primary" onclick="send()">Отправить Алине</button>
+</div>
+
+<div class="card">
+  <h3>Ответ Алины</h3>
+  <audio id="player" controls style="width:100%"></audio>
+  <pre id="text"></pre>
+</div>
+
+<script>
+async function send() {
+  const file = document.getElementById("audio").files[0];
+  if (!file) return alert("No audio");
+
+  const lang = document.querySelector("input[name=lang]:checked").value;
+
+  const fd = new FormData();
+  fd.append("audio", file);
+  fd.append("lang", lang);
+
+  const r = await fetch("/alina/voice", { method:"POST", body:fd });
+  const d = await r.json();
+
+  document.getElementById("text").textContent = d.answer || "";
+  if (d.audio_base64) {
+    document.getElementById("player").src =
+      "data:audio/mpeg;base64," + d.audio_base64;
+  }
+}
+</script>
+
+</body>
+</html>
+""")
 
 
-class AlinaAssistant:
-    """
-    Локальное состояние Алины (history) на уровне процесса.
-    В проде лучше хранить историю по session_id, но пока оставляем простой вариант.
-    """
-
-    def __init__(self, mode: str = "ru", model: str = "gpt-4o-mini") -> None:
-        self.cfg = AssistantConfig(mode=mode, model=model)
-        self.history: List[Dict[str, str]] = []  # только user/assistant, без system
-
-    def reset(self) -> None:
-        self.history = []
-
-    def _build_messages(self, user_text: str) -> List[Dict[str, str]]:
-        msgs: List[Dict[str, str]] = [{"role": "system", "content": _system_prompt(self.cfg.mode)}]
-        msgs.extend(_trim_history(self.history, self.cfg.max_history_messages))
-        msgs.append({"role": "user", "content": user_text})
-        return msgs
-
-    def _call_llm(
-        self,
-        messages: List[Dict[str, str]],
-        cancel_token: Optional[Any] = None,
-        use_llm_stream: bool = False,
-    ) -> str:
-        """
-        Сейчас у тебя в репо “streaming/cancel” может быть, а может и нет.
-        Поэтому:
-        - если use_llm_stream=True и в llm_client есть streaming-функция — используем
-        - иначе fallback на обычный chat_with_alina
-        """
-        if use_llm_stream:
-            # Пытаемся найти streaming-обёртку в llm_client (если ты её добавлял)
-            try:
-                from assistant.llm_client import chat_with_alina_stream  # type: ignore
-
-                return chat_with_alina_stream(
-                    messages=messages,
-                    model=self.cfg.model,
-                    temperature=self.cfg.temperature,
-                    cancel_token=cancel_token,
-                ) or ""
-            except Exception:
-                # нет streaming реализации — используем обычную
-                pass
-
-        return chat_with_alina(
-            messages=messages,
-            model=self.cfg.model,
-            temperature=self.cfg.temperature,
-        ) or ""
-
-    def handle_user_audio(
-        self,
-        audio_bytes: bytes,
-        filename: str = "audio.wav",
-        cancel_token: Optional[Any] = None,
-        use_llm_stream: bool = False,
-    ) -> Dict[str, Any]:
-        """
-        Pipeline: STT → LLM → TTS
-        Возвращает payload для фронта.
-        """
-        t0 = time.perf_counter()
-
-        # 1) STT
-        t_stt0 = time.perf_counter()
-        transcript = transcribe(audio_bytes, filename=filename)
-        stt_ms = int((time.perf_counter() - t_stt0) * 1000)
-
-        transcript = (transcript or "").strip()
-        if not transcript:
-            # Не распознали — вернём пусто, но быстро
-            total_ms = int((time.perf_counter() - t0) * 1000)
-            return {
-                "transcript": "",
-                "answer": "",
-                "audio_base64": "",
-                "audio_mime": "audio/mpeg",
-                "history": self.history,
-                "timings": {"stt_ms": stt_ms, "llm_ms": 0, "tts_ms": 0, "total_ms": total_ms},
-            }
-
-        # 2) LLM
-        t_llm0 = time.perf_counter()
-        messages = self._build_messages(transcript)
-        answer = self._call_llm(messages, cancel_token=cancel_token, use_llm_stream=use_llm_stream).strip()
-        llm_ms = int((time.perf_counter() - t_llm0) * 1000)
-
-        # Обновляем историю (только user/assistant)
-        self.history.append({"role": "user", "content": transcript})
-        self.history.append({"role": "assistant", "content": answer})
-        self.history = _trim_history(self.history, self.cfg.max_history_messages)
-
-        # 3) TTS
-        t_tts0 = time.perf_counter()
-        audio_out: bytes = b""
-        audio_mime = "audio/mpeg"
-
-        # Если был cancel во время LLM — можно “срезать” TTS и вернуть пусто
-        # (работает только если cancel_token имеет поле/метод, но мы не навязываем интерфейс)
-        try:
-            if cancel_token is not None:
-                # поддержим варианты: cancel_token.cancelled / cancel_token.is_cancelled / cancel_token.value
-                cancelled = bool(
-                    getattr(cancel_token, "cancelled", False)
-                    or getattr(cancel_token, "is_cancelled", False)
-                    or getattr(cancel_token, "value", False)
-                )
-                if cancelled:
-                    total_ms = int((time.perf_counter() - t0) * 1000)
-                    return {
-                        "transcript": transcript,
-                        "answer": answer,
-                        "audio_base64": "",
-                        "audio_mime": audio_mime,
-                        "history": self.history,
-                        "timings": {"stt_ms": stt_ms, "llm_ms": llm_ms, "tts_ms": 0, "total_ms": total_ms},
-                    }
-        except Exception:
-            pass
-
-        if answer:
-            audio_out = tts_elevenlabs(answer)
-        tts_ms = int((time.perf_counter() - t_tts0) * 1000)
-
-        audio_base64 = base64.b64encode(audio_out).decode("utf-8") if audio_out else ""
-        total_ms = int((time.perf_counter() - t0) * 1000)
-
-        return {
-            "transcript": transcript,
-            "answer": answer,
-            "audio_base64": audio_base64,
-            "audio_mime": audio_mime,
-            "history": self.history,
-            "timings": {
-                "stt_ms": stt_ms,
-                "llm_ms": llm_ms,
-                "tts_ms": tts_ms,
-                "total_ms": total_ms,
-            },
-        }
+# ---------- Local ----------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("alina_server:app", host="0.0.0.0", port=8000)
