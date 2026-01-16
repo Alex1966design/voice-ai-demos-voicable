@@ -5,56 +5,65 @@ import os
 from typing import Optional
 
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
+
+# OpenAI STT client (Whisper)
+if OPENAI_API_KEY:
+    openai_client = OpenAI(
+        api_key=OPENAI_API_KEY,
+        max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "2")),
+        timeout=float(os.getenv("OPENAI_TIMEOUT_SEC", "30")),
+    )
+else:
+    openai_client = None
+
+# Deepgram client (optional)
+deepgram_client = None
+if DEEPGRAM_API_KEY:
+    try:
+        from assistant.deepgram_client import deepgram_client as _dg  # type: ignore
+        deepgram_client = _dg
+    except Exception as e:
+        # If Deepgram SDK isn't installed/compatible, you will see it in logs later.
+        deepgram_client = None
 
 
 async def transcribe(
     audio_bytes: bytes,
-    filename: str = "audio.webm",
-    mimetype: Optional[str] = None,
+    filename: str = "audio.wav",
     lang: str = "th",
+    content_type: Optional[str] = None,
 ) -> str:
     """
     STT router:
-      - If DEEPGRAM_API_KEY exists -> use Deepgram (best for Thai demo, supports webm/mp3 well)
-      - Else fallback to OpenAI Whisper (optional)
+      - Thai (th) -> Deepgram (best for browser webm)
+      - Otherwise -> OpenAI Whisper
     """
     if not audio_bytes:
         return ""
 
-    deepgram_key = os.getenv("DEEPGRAM_API_KEY", "").strip()
-    if deepgram_key:
-        from .deepgram_client import deepgram_client  # local import to avoid import-time crash
+    # 1) TH priority -> Deepgram
+    if lang == "th" and deepgram_client is not None:
+        try:
+            # Deepgram prefers correct mimetype for webm/ogg
+            return (await deepgram_client.transcribe_bytes(audio_bytes, mimetype=content_type, lang="th")).strip()
+        except Exception as e:
+            # fall through to Whisper if configured
+            print(f"Deepgram STT failed, fallback to Whisper: {e}")
 
-        model = os.getenv("DEEPGRAM_MODEL", "nova-3")
-        return await deepgram_client.transcribe_bytes(
-            audio_bytes=audio_bytes,
-            mimetype=mimetype,
-            lang=lang or "th",
-            model=model,
-            smart_format=True,
-        )
-
-    # Optional fallback: OpenAI Whisper (if you ever want it)
-    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not openai_key:
-        raise RuntimeError("No STT provider configured: set DEEPGRAM_API_KEY or OPENAI_API_KEY")
-
-    from openai import OpenAI
-
-    client = OpenAI(
-        api_key=openai_key,
-        max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "2")),
-        timeout=float(os.getenv("OPENAI_TIMEOUT_SEC", "30")),
-    )
+    # 2) Whisper fallback
+    if openai_client is None:
+        raise RuntimeError("No STT provider available: set DEEPGRAM_API_KEY (recommended for TH) or OPENAI_API_KEY")
 
     try:
-        resp = client.audio.transcriptions.create(
+        resp = openai_client.audio.transcriptions.create(
             model=os.getenv("OPENAI_STT_MODEL", "whisper-1"),
             file=(filename, audio_bytes),
-            # language hint improves results for Thai (if Whisper is used)
-            language=(lang or "th"),
         )
         return (resp.text or "").strip()
     except Exception as e:
