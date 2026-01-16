@@ -1,75 +1,69 @@
+# backend/assistant/deepgram_client.py
 from __future__ import annotations
 
+import os
 from typing import Optional
 
-from deepgram import AsyncDeepgramClient
-from .config import settings
+import httpx
+
+
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
+if not DEEPGRAM_API_KEY:
+    raise RuntimeError("DEEPGRAM_API_KEY is not set in environment")
 
 
 class DeepgramClient:
     """
-    Async Deepgram client for STT.
-    Designed for browser microphone input (webm/opus) and audio files.
+    Async REST client for Deepgram STT.
+    Works with raw audio bytes received from browser uploads (mp3/webm/wav/...).
     """
 
     def __init__(self) -> None:
-        if not settings.deepgram_api_key:
-            raise RuntimeError("DEEPGRAM_API_KEY is not set")
-
-        # Explicit API key for reliability
-        self.client = AsyncDeepgramClient(api_key=settings.deepgram_api_key)
+        self.api_key = DEEPGRAM_API_KEY
+        self.base_url = "https://api.deepgram.com/v1/listen"
 
     async def transcribe_bytes(
         self,
         audio_bytes: bytes,
-        *,
         mimetype: Optional[str] = None,
-        language: Optional[str] = None,
+        lang: str = "th",
+        model: str = "nova-3",
+        smart_format: bool = True,
     ) -> str:
-        """
-        Transcribe raw audio bytes via Deepgram.
-
-        Args:
-            audio_bytes: raw audio bytes from browser or file
-            mimetype: e.g. "audio/webm", "audio/webm;codecs=opus", "audio/mpeg"
-            language: "th", "en", etc.
-
-        Returns:
-            Transcribed text
-        """
         if not audio_bytes:
             return ""
 
-        # Deepgram parameters
-        options = {
-            "model": settings.deepgram_model or "nova-2",
-            "smart_format": True,
+        headers = {
+            "Authorization": f"Token {self.api_key}",
+            # If we don't know mimetype - Deepgram still can handle it, but better pass if known.
+            "Content-Type": (mimetype or "application/octet-stream"),
         }
 
-        # Explicit language hint (VERY IMPORTANT for Thai)
-        if language:
-            options["language"] = language
+        params = {
+            "model": model,
+            "smart_format": "true" if smart_format else "false",
+        }
 
-        # Deepgram SDK accepts bytes directly
-        response = await self.client.listen.v1.media.transcribe_file(
-            request=audio_bytes,
-            mimetype=mimetype,     # 👈 КЛЮЧЕВО для webm/opus
-            **options,
-        )
+        # Deepgram language codes: th, en, ru, etc.
+        # For Thai demo we force th.
+        if lang:
+            params["language"] = lang
 
+        timeout = float(os.getenv("DEEPGRAM_TIMEOUT_SEC", "45"))
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(self.base_url, params=params, headers=headers, content=audio_bytes)
+
+        if r.status_code >= 400:
+            raise RuntimeError(f"Deepgram STT failed ({r.status_code}): {r.text[:800]}")
+
+        data = r.json()
         try:
-            transcript = (
-                response.results
-                .channels[0]
-                .alternatives[0]
-                .transcript
-            )
+            transcript = data["results"]["channels"][0]["alternatives"][0]["transcript"]
         except Exception:
-            # Safe fallback if Deepgram response shape changes
-            transcript = ""
+            raise RuntimeError(f"Deepgram response parse error: {str(data)[:800]}")
 
-        return transcript.strip()
+        return (transcript or "").strip()
 
 
-# Singleton instance
 deepgram_client = DeepgramClient()
