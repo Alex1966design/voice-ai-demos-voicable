@@ -2,69 +2,135 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Optional, Any
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from deepgram import AsyncDeepgramClient
 
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 
-# OpenAI STT client (Whisper)
-if OPENAI_API_KEY:
-    openai_client = OpenAI(
-        api_key=OPENAI_API_KEY,
-        max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "2")),
-        timeout=float(os.getenv("OPENAI_TIMEOUT_SEC", "30")),
-    )
-else:
-    openai_client = None
+def _get_env(name: str, default: str = "") -> str:
+    v = os.getenv(name, default)
+    return (v or "").strip()
 
-# Deepgram client (optional)
-deepgram_client = None
-if DEEPGRAM_API_KEY:
+
+DEEPGRAM_API_KEY = _get_env("DEEPGRAM_API_KEY")
+if not DEEPGRAM_API_KEY:
+    raise RuntimeError("DEEPGRAM_API_KEY is not set in .env or environment")
+
+# Model: nova-2 / nova-3 etc.
+DEEPGRAM_MODEL = _get_env("DEEPGRAM_MODEL", "nova-3")
+
+# Optional: default language; for Thai we will force "th" by lang param
+DEEPGRAM_LANGUAGE_DEFAULT = _get_env("DEEPGRAM_LANGUAGE", "")  # e.g. "en" or ""
+
+
+client = AsyncDeepgramClient(api_key=DEEPGRAM_API_KEY)
+
+
+def _lang_to_deepgram(lang: str) -> Optional[str]:
+    """
+    Map UI lang -> Deepgram language code.
+    If None, Deepgram may auto-detect (depending on plan/model).
+    """
+    lang = (lang or "").lower().strip()
+    if lang == "th":
+        return "th"
+    if lang == "en":
+        return "en"
+    if lang == "ru":
+        return "ru"
+    # fallback to env default or None
+    return DEEPGRAM_LANGUAGE_DEFAULT or None
+
+
+def _guess_mimetype(filename: str, provided: Optional[str]) -> Optional[str]:
+    if provided:
+        return provided
+    fn = (filename or "").lower()
+    if fn.endswith(".webm"):
+        return "audio/webm"
+    if fn.endswith(".mp3"):
+        return "audio/mpeg"
+    if fn.endswith(".wav"):
+        return "audio/wav"
+    if fn.endswith(".m4a"):
+        return "audio/mp4"
+    if fn.endswith(".ogg"):
+        return "audio/ogg"
+    return None
+
+
+def _safe_extract_transcript(resp: Any) -> str:
+    """
+    Deepgram SDK response formats can vary slightly by version.
+    We defensively extract transcript.
+    """
     try:
-        from assistant.deepgram_client import deepgram_client as _dg  # type: ignore
-        deepgram_client = _dg
-    except Exception as e:
-        # If Deepgram SDK isn't installed/compatible, you will see it in logs later.
-        deepgram_client = None
+        # Common: resp.results.channels[0].alternatives[0].transcript
+        transcript = resp.results.channels[0].alternatives[0].transcript
+        return (transcript or "").strip()
+    except Exception:
+        pass
+
+    try:
+        # Sometimes dict-like
+        results = resp.get("results") or {}
+        channels = results.get("channels") or []
+        if channels:
+            alts = channels[0].get("alternatives") or []
+            if alts:
+                return (alts[0].get("transcript") or "").strip()
+    except Exception:
+        pass
+
+    return ""
 
 
 async def transcribe(
     audio_bytes: bytes,
     filename: str = "audio.wav",
-    lang: str = "th",
-    content_type: Optional[str] = None,
+    lang: str = "ru",
+    mimetype: Optional[str] = None,
 ) -> str:
     """
-    STT router:
-      - Thai (th) -> Deepgram (best for browser webm)
-      - Otherwise -> OpenAI Whisper
+    STT via Deepgram (async). Returns recognised text.
+    Works with bytes coming from browser (often audio/webm).
     """
     if not audio_bytes:
         return ""
 
-    # 1) TH priority -> Deepgram
-    if lang == "th" and deepgram_client is not None:
-        try:
-            # Deepgram prefers correct mimetype for webm/ogg
-            return (await deepgram_client.transcribe_bytes(audio_bytes, mimetype=content_type, lang="th")).strip()
-        except Exception as e:
-            # fall through to Whisper if configured
-            print(f"Deepgram STT failed, fallback to Whisper: {e}")
+    dg_lang = _lang_to_deepgram(lang)
+    mt = _guess_mimetype(filename, mimetype)
 
-    # 2) Whisper fallback
-    if openai_client is None:
-        raise RuntimeError("No STT provider available: set DEEPGRAM_API_KEY (recommended for TH) or OPENAI_API_KEY")
+    # Options
+    options: dict[str, Any] = {
+        "model": DEEPGRAM_MODEL,
+        "smart_format": True,
+    }
+    # If language is set, pass it explicitly (good for Thai).
+    if dg_lang:
+        options["language"] = dg_lang
 
+    # Important: content-type helps Deepgram decode webm/mp3/wav
+    # Depending on SDK version, parameter name can be mimetype/content_type.
+    # We use 'mimetype' in the call below where supported.
     try:
-        resp = openai_client.audio.transcriptions.create(
-            model=os.getenv("OPENAI_STT_MODEL", "whisper-1"),
-            file=(filename, audio_bytes),
+        resp = await client.listen.v1.media.transcribe_file(
+            request=audio_bytes,
+            mimetype=mt,   # critical for audio/webm
+            **options,
         )
-        return (resp.text or "").strip()
+    except TypeError:
+        # Fallback for SDK variants that use content_type instead of mimetype
+        resp = await client.listen.v1.media.transcribe_file(
+            request=audio_bytes,
+            content_type=mt,
+            **options,
+        )
     except Exception as e:
-        raise RuntimeError(f"OpenAI STT failed: {e}")
+        raise RuntimeError(f"Deepgram STT failed: {e}")
+
+    transcript = _safe_extract_transcript(resp)
+    return transcript
