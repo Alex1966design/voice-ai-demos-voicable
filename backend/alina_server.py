@@ -2,13 +2,13 @@
 """
 Alina Voice Assistant (FastAPI)
 Routes:
-  - GET  /health         -> JSON healthcheck
+  - GET  /health         -> JSON healthcheck (for Railway / LB)
   - GET  /               -> HTML UI (RU / EN / TH)
   - POST /alina/voice    -> STT -> LLM -> TTS pipeline
   - POST /alina/cancel   -> cancel in-flight generation for a session_id (best-effort)
 
-Railway start command (Root Directory = backend):
-  uvicorn alina_server:app --host 0.0.0.0 --port $PORT
+Railway start command (repo root):
+  uvicorn backend.alina_server:app --host 0.0.0.0 --port $PORT
 """
 
 from __future__ import annotations
@@ -35,9 +35,8 @@ except Exception:
             self.cancelled = True
 
 
-# --- Optional: try to use your existing assistant class (but NEVER let it break demo) ---
+# --- Try to use your existing assistant; otherwise fall back to direct pipeline ---
 assistant_import_error = None
-assistant_ru = assistant_en = assistant_th = None
 try:
     from assistant.alina import AlinaAssistant  # type: ignore
 
@@ -46,12 +45,13 @@ try:
     assistant_th = AlinaAssistant(mode="th")
 except Exception as e:
     assistant_import_error = e
-    assistant_ru = assistant_en = assistant_th = None
+    assistant_ru = assistant_en = assistant_th = None  # type: ignore
 
-# --- Fallback pipeline (used always when assistant is missing OR crashes) ---
-from assistant.stt_client import transcribe  # async (we will await)
-from assistant.llm_client import chat_with_alina  # sync
-from assistant.elevenlabs_client import tts_elevenlabs  # sync
+    # fallback pipeline imports (must exist in your repo)
+    # IMPORTANT: transcribe is async now (Deepgram)
+    from assistant.stt_client import transcribe  # type: ignore
+    from assistant.llm_client import chat_with_alina  # type: ignore
+    from assistant.elevenlabs_client import tts_elevenlabs  # type: ignore
 
 
 app = FastAPI(
@@ -62,7 +62,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # demo; tighten later
+    allow_origins=["*"],  # demo; tighten for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -95,11 +95,10 @@ def _pick_lang_assistant(lang: str):
 
 
 def _fallback_system_prompt(lang: str) -> str:
-    # Быстрый демо-режим: просим отвечать строго на выбранном языке
     if lang == "th":
         return (
-            "You are Alina, a helpful voice assistant. Reply in Thai language only. "
-            "Be concise, structured, and friendly. If user asks about Phuket food, give practical suggestions."
+            "You are Alina, a helpful voice assistant. Reply in Thai. "
+            "Be concise, structured, and friendly."
         )
     if lang == "en":
         return (
@@ -115,20 +114,20 @@ def _fallback_system_prompt(lang: str) -> str:
 async def _fallback_pipeline(
     audio_bytes: bytes,
     filename: str,
-    content_type: Optional[str],
     lang: str,
     cancel_token: CancelToken,
+    mimetype: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Fallback pipeline:
-      STT -> LLM -> TTS (ElevenLabs)
+    If assistant.alina is unavailable, we do:
+      STT (Deepgram async) -> LLM -> TTS (ElevenLabs)
     """
-    # 1) STT
+    # 1) STT (Deepgram) - ASYNC
     transcript = await transcribe(
         audio_bytes=audio_bytes,
         filename=filename,
         lang=lang,
-        content_type=content_type,
+        mimetype=mimetype,
     )
 
     if cancel_token.cancelled:
@@ -162,25 +161,21 @@ async def _fallback_pipeline(
     audio_mp3 = tts_elevenlabs(answer)
     audio_b64 = base64.b64encode(audio_mp3).decode("utf-8")
 
-    timings: Dict[str, Any] = {}
-    if assistant_import_error is not None:
-        timings["assistant_import_error"] = str(assistant_import_error)
-
     return {
         "transcript": transcript,
         "answer": answer,
         "audio_base64": audio_b64,
         "audio_mime": "audio/mpeg",
         "history": messages + [{"role": "assistant", "content": answer}],
-        "timings": timings,
+        "timings": {},
     }
 
 
 @app.post("/alina/voice")
 async def alina_voice(
     audio: UploadFile = File(...),
-    lang: str = Form("th"),        # "ru" | "en" | "th"
-    session_id: str = Form(""),
+    lang: str = Form("ru"),        # "ru" | "en" | "th"
+    session_id: str = Form(""),    # comes from frontend
 ):
     """
     Full voice cycle:
@@ -199,47 +194,47 @@ async def alina_voice(
     active_cancels[session_id] = cancel_token
 
     filename = audio.filename or "audio.wav"
-    content_type = audio.content_type  # IMPORTANT for Deepgram (webm/ogg/wav)
-    # Для webm иногда content_type пустой — подстрахуемся расширением
-    if not content_type and filename.lower().endswith(".webm"):
-        content_type = "audio/webm"
+    mimetype = audio.content_type  # important for Deepgram (webm/mp3/wav)
 
     try:
-        # 1) Попытка primary assistant (если есть) — но без права ломать демо
-        result: Dict[str, Any]
+        # Primary path: your AlinaAssistant implementation
         if assistant_ru is not None:
-            try:
-                assistant = _pick_lang_assistant(lang)
-                if assistant is None:
-                    raise RuntimeError("Assistant not initialised")
+            assistant = _pick_lang_assistant(lang)
+            if assistant is None:
+                raise RuntimeError("Assistant not initialised")
 
-                # Expect assistant.handle_user_audio(...) to return dict
-                maybe = assistant.handle_user_audio(
-                    audio_bytes,
-                    filename,
-                    cancel_token=cancel_token,
-                    use_llm_stream=True,
-                )
-                if not isinstance(maybe, dict):
-                    raise RuntimeError("assistant.handle_user_audio must return dict")
-                result = maybe
-            except Exception as e:
-                # ВАЖНО: не падаем — уходим в fallback и добавляем причину
-                fb = await _fallback_pipeline(audio_bytes, filename, content_type, lang, cancel_token)
-                fb.setdefault("timings", {})
-                fb["timings"]["assistant_failed_fallback"] = str(e)
-                result = fb
+            # If your assistant supports async, you can upgrade later.
+            # For now keep sync.
+            result = assistant.handle_user_audio(
+                audio_bytes,
+                filename,
+                cancel_token=cancel_token,
+                use_llm_stream=True,
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError("assistant.handle_user_audio must return dict")
+
+        # Fallback path if assistant import failed
         else:
-            # 2) Fallback pipeline (надёжный демо-режим)
-            result = await _fallback_pipeline(audio_bytes, filename, content_type, lang, cancel_token)
+            result = await _fallback_pipeline(audio_bytes, filename, lang, cancel_token, mimetype=mimetype)
+            result.setdefault("timings", {})
+            result["timings"]["assistant_import_error"] = str(assistant_import_error)
 
         result["session_id"] = session_id
         return JSONResponse(content=result)
 
+    except HTTPException:
+        raise
+
     except Exception as e:
-        # Логируем traceback в Railway logs — это ключ к любым оставшимся 500
-        print("ERROR in /alina/voice:", str(e))
-        print(traceback.format_exc())
+        # Make 500 *informative* for you in DevTools
+        debug = os.getenv("DEBUG_ERRORS", "1") == "1"
+        if debug:
+            tb = traceback.format_exc()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Alina error: {e}\n---\n{tb}",
+            )
         raise HTTPException(status_code=500, detail=f"Alina error: {e}")
 
     finally:
@@ -248,7 +243,7 @@ async def alina_voice(
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    # UI оставляем; можешь позже скрыть RU ради демо
+    # UI unchanged (your current HTML). Keep as-is.
     html = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -301,7 +296,7 @@ async def index():
 
     <div style="margin-bottom: 10px;">
       <label style="margin-right: 10px;">
-        <input type="radio" name="lang" value="ru" />
+        <input type="radio" name="lang" value="ru" checked />
         🇷🇺 RU
       </label>
       <label style="margin-right: 10px;">
@@ -309,7 +304,7 @@ async def index():
         🇬🇧 EN
       </label>
       <label>
-        <input type="radio" name="lang" value="th" checked />
+        <input type="radio" name="lang" value="th" />
         🇹🇭 TH
       </label>
     </div>
@@ -334,28 +329,28 @@ async def index():
   <script>
     const I18N = {
       ru: { title:"Alina – голосовой ассистент", subtitle:"Отдельный сервер: STT → LLM → TTS (RU / EN / TH)",
-        step1:"Шаг 1. Запиши или выбери аудиофайл", hint:"Можно выбрать готовый аудиофайл или записать голос с микрофона прямо в браузере.",
+        step1:"Шаг 1. Запиши или выбери аудиофайл",
+        hint:"Можно выбрать готовый аудиофайл или записать голос с микрофона прямо в браузере.",
         step2:"Шаг 2. Отправь запрос Алине", send:"Отправить Алине", answer:"Ответ Алины",
-        rec:"Запись идёт…", recDone:"Запись завершена. Теперь можно отправить Алине.", micErr:"Не удалось получить доступ к микрофону.",
-        sending:"Отправка…", done:"Готово ✔", err:"Ошибка ✖"
-      },
+        rec:"Запись идёт…", recDone:"Запись завершена. Теперь можно отправить Алине.",
+        micErr:"Не удалось получить доступ к микрофону.", sending:"Отправка…", done:"Готово ✔", err:"Ошибка ✖" },
       en: { title:"Alina – voice assistant", subtitle:"Standalone server: STT → LLM → TTS (RU / EN / TH)",
-        step1:"Step 1. Record or choose an audio file", hint:"You can select an audio file or record from the microphone directly in the browser.",
+        step1:"Step 1. Record or choose an audio file",
+        hint:"You can select an audio file or record from the microphone directly in the browser.",
         step2:"Step 2. Send a request to Alina", send:"Send to Alina", answer:"Alina's reply",
-        rec:"Recording…", recDone:"Recording finished. You can now send it to Alina.", micErr:"Microphone access error.",
-        sending:"Sending…", done:"Done ✔", err:"Error ✖"
-      },
+        rec:"Recording…", recDone:"Recording finished. You can now send it to Alina.",
+        micErr:"Microphone access error.", sending:"Sending…", done:"Done ✔", err:"Error ✖" },
       th: { title:"Alina – ผู้ช่วยเสียง", subtitle:"เซิร์ฟเวอร์เดี่ยว: STT → LLM → TTS (RU / EN / TH)",
-        step1:"ขั้นตอนที่ 1 บันทึกเสียงหรือเลือกไฟล์เสียง", hint:"คุณสามารถเลือกไฟล์เสียง หรือบันทึกเสียงจากไมโครโฟนในเบราว์เซอร์ได้",
+        step1:"ขั้นตอนที่ 1 บันทึกเสียงหรือเลือกไฟล์เสียง",
+        hint:"คุณสามารถเลือกไฟล์เสียง หรือบันทึกเสียงจากไมโครโฟนในเบราว์เซอร์ได้",
         step2:"ขั้นตอนที่ 2 ส่งคำถามให้ Alina", send:"ส่งให้ Alina", answer:"คำตอบของ Alina",
-        rec:"กำลังบันทึก…", recDone:"บันทึกเสร็จแล้ว พร้อมส่งให้ Alina", micErr:"ไม่สามารถเข้าถึงไมโครโฟนได้",
-        sending:"กำลังส่ง…", done:"เสร็จสิ้น ✔", err:"เกิดข้อผิดพลาด ✖"
-      }
+        rec:"กำลังบันทึก…", recDone:"บันทึกเสร็จแล้ว พร้อมส่งให้ Alina",
+        micErr:"ไม่สามารถเข้าถึงไมโครโฟนได้", sending:"กำลังส่ง…", done:"เสร็จสิ้น ✔", err:"เกิดข้อผิดพลาด ✖" }
     };
 
-    function getUILang(){ return document.querySelector('input[name="lang"]:checked').value || "th"; }
+    function getUILang(){ return document.querySelector('input[name="lang"]:checked').value || "ru"; }
     function applyUI(lang){
-      const t = I18N[lang] || I18N.th;
+      const t = I18N[lang] || I18N.ru;
       document.getElementById("ui-title").textContent = t.title;
       document.getElementById("ui-subtitle").textContent = t.subtitle;
       document.getElementById("ui-step1").textContent = t.step1;
@@ -374,7 +369,6 @@ async def index():
     const btnSend=document.getElementById("btn-send");
     const sendStatus=document.getElementById("send-status");
     const audioFileInput=document.getElementById("audio-file");
-
     const replyAudio=document.getElementById("reply-audio");
     const replyChat=document.getElementById("reply-chat");
     const replyHistory=document.getElementById("reply-history");
@@ -383,54 +377,44 @@ async def index():
 
     uiSession.textContent="session: "+sessionId;
     applyUI(getUILang());
-
     document.querySelectorAll('input[name="lang"]').forEach(r=>r.addEventListener("change",()=>applyUI(getUILang())));
 
     async function cancelServerIfNeeded(){
-      const fd=new FormData();
-      fd.append("session_id",sessionId);
+      const fd=new FormData(); fd.append("session_id", sessionId);
       try{ await fetch("/alina/cancel",{method:"POST",body:fd}); }catch(e){}
     }
 
-    btnStart.onclick=async()=>{
-      recordedChunks=[];
-      recordStatus.textContent="";
-
+    btnStart.onclick=async ()=>{
+      recordedChunks=[]; recordStatus.textContent="";
       try{ replyAudio.pause(); replyAudio.currentTime=0; replyAudio.src=""; }catch(e){}
       await cancelServerIfNeeded();
-
       try{
         const stream=await navigator.mediaDevices.getUserMedia({audio:true});
         mediaRecorder=new MediaRecorder(stream);
         mediaRecorder.ondataavailable=(e)=>{ if(e.data.size>0) recordedChunks.push(e.data); };
-        mediaRecorder.onstop=()=>{ const t=I18N[getUILang()]||I18N.th; recordStatus.textContent=t.recDone; };
+        mediaRecorder.onstop=()=>{ const t=I18N[getUILang()]||I18N.ru; recordStatus.textContent=t.recDone; };
         mediaRecorder.start();
         btnStart.disabled=true; btnStop.disabled=false;
-        const t=I18N[getUILang()]||I18N.th; recordStatus.textContent=t.rec;
+        const t=I18N[getUILang()]||I18N.ru; recordStatus.textContent=t.rec;
       }catch(err){
         console.error(err);
-        const t=I18N[getUILang()]||I18N.th; recordStatus.textContent=t.micErr;
+        const t=I18N[getUILang()]||I18N.ru; recordStatus.textContent=t.micErr;
       }
     };
 
     btnStop.onclick=()=>{
       if(mediaRecorder && mediaRecorder.state!=="inactive"){
         mediaRecorder.stop();
-        btnStart.disabled=false;
-        btnStop.disabled=true;
+        btnStart.disabled=false; btnStop.disabled=true;
       }
     };
 
-    btnSend.onclick=async()=>{
-      const t=I18N[getUILang()]||I18N.th;
-
-      sendStatus.textContent="";
-      sendStatus.className="";
+    btnSend.onclick=async ()=>{
+      const t=I18N[getUILang()]||I18N.ru;
+      sendStatus.textContent=""; sendStatus.className="";
       uiTimings.style.display="none"; uiTimings.textContent="";
 
-      let audioBlob=null;
-      let filename="audio.wav";
-
+      let audioBlob=null, filename="audio.wav";
       if(recordedChunks.length>0){
         audioBlob=new Blob(recordedChunks,{type:"audio/webm"});
         filename="recording.webm";
@@ -441,10 +425,10 @@ async def index():
       }
 
       const formData=new FormData();
-      formData.append("audio",audioBlob,filename);
+      formData.append("audio", audioBlob, filename);
       const lang=document.querySelector('input[name="lang"]:checked').value;
-      formData.append("lang",lang);
-      formData.append("session_id",sessionId);
+      formData.append("lang", lang);
+      formData.append("session_id", sessionId);
 
       btnSend.disabled=true;
       sendStatus.textContent=t.sending;
@@ -455,8 +439,8 @@ async def index():
           const errData=await resp.json().catch(()=>({}));
           throw new Error(errData.detail || ("HTTP "+resp.status));
         }
-
         const data=await resp.json();
+
         if(data.session_id){ sessionId=data.session_id; uiSession.textContent="session: "+sessionId; }
 
         if(data.audio_base64){
@@ -480,19 +464,17 @@ async def index():
         }
 
         replyHistory.style.display="block";
-        replyHistory.textContent="history:\\n"+JSON.stringify(data.history,null,2);
+        replyHistory.textContent="История диалога (history):\\n"+JSON.stringify(data.history,null,2);
 
         if(data.timings){
           uiTimings.style.display="block";
-          uiTimings.textContent="timings:\\n"+JSON.stringify(data.timings,null,2);
+          uiTimings.textContent="Latency breakdown (ms):\\n"+JSON.stringify(data.timings,null,2);
         }
 
-        sendStatus.textContent=t.done;
-        sendStatus.className="status-ok";
+        sendStatus.textContent=t.done; sendStatus.className="status-ok";
       }catch(err){
         console.error(err);
-        sendStatus.textContent=t.err;
-        sendStatus.className="status-error";
+        sendStatus.textContent=t.err; sendStatus.className="status-error";
       }finally{
         btnSend.disabled=false;
       }
