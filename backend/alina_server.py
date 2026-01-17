@@ -1,112 +1,604 @@
 # backend/alina_server.py
 """
 Alina Voice Assistant (FastAPI)
-STT (Deepgram async) -> LLM -> TTS (ElevenLabs)
-RU / EN / TH
+
+Routes:
+  - GET  /health         -> JSON healthcheck (for Railway / LB)
+  - GET  /               -> HTML UI (RU / EN / TH)
+  - POST /alina/voice    -> STT -> LLM -> TTS pipeline
+  - POST /alina/cancel   -> cancel in-flight generation for a session_id (best-effort)
+
+Railway start command (repo root):
+  uvicorn backend.alina_server:app --host 0.0.0.0 --port $PORT
 """
 
 from __future__ import annotations
 
 import base64
+import logging
 import os
-import uuid
 import traceback
-from typing import Dict, Any, Optional
+import uuid
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
-# ============================================================
-# CONFIG
-# ============================================================
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("alina")
 
 DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"
+USE_ASSISTANT = os.getenv("USE_ASSISTANT", "0") == "1"  # OFF by default (stability first)
 
-# ============================================================
-# Cancel token (safe)
-# ============================================================
+MAX_AUDIO_MB = float(os.getenv("MAX_AUDIO_MB", "25"))
+MAX_AUDIO_BYTES = int(MAX_AUDIO_MB * 1024 * 1024)
 
-class CancelToken:
-    def __init__(self):
-        self.cancelled = False
-
-    def cancel(self):
-        self.cancelled = True
-
-
-active_cancels: Dict[str, CancelToken] = {}
-
-# ============================================================
-# Import pipeline modules (STRICT)
-# ============================================================
-
+# ------------------------------------------------------------
+# Cancel token (fallback-safe)
+# ------------------------------------------------------------
 try:
-    from assistant.stt_client import transcribe  # async Deepgram
-    from assistant.llm_client import chat_with_alina
-    from assistant.elevenlabs_client import tts_elevenlabs
-except Exception as e:
-    raise RuntimeError(f"CRITICAL IMPORT ERROR: {e}")
+    from assistant.llm_client import CancelToken  # type: ignore
+except Exception:
+    class CancelToken:
+        def __init__(self, cancelled: bool = False):
+            self.cancelled = cancelled
 
-# ============================================================
-# FastAPI
-# ============================================================
+        def cancel(self):
+            self.cancelled = True
+
+
+# ------------------------------------------------------------
+# Primary assistant (optional)
+# ------------------------------------------------------------
+assistant_import_error: Optional[Exception] = None
+assistant_ru = assistant_en = assistant_th = None  # type: ignore
+
+if USE_ASSISTANT:
+    try:
+        from assistant.alina import AlinaAssistant  # type: ignore
+        assistant_ru = AlinaAssistant(mode="ru")
+        assistant_en = AlinaAssistant(mode="en")
+        assistant_th = AlinaAssistant(mode="th")
+        logger.info("USE_ASSISTANT=1 -> AlinaAssistant initialised")
+    except Exception as e:
+        assistant_import_error = e
+        assistant_ru = assistant_en = assistant_th = None  # type: ignore
+        logger.exception("Failed to import/init AlinaAssistant, will use fallback pipeline")
+
+
+# ------------------------------------------------------------
+# Fallback pipeline (must exist in your repo)
+# ------------------------------------------------------------
+# IMPORTANT: transcribe is async (Deepgram)
+from assistant.stt_client import transcribe  # type: ignore
+from assistant.llm_client import chat_with_alina  # type: ignore
+from assistant.elevenlabs_client import tts_elevenlabs  # type: ignore
+
 
 app = FastAPI(
     title="Alina Voice Assistant",
-    version="2.0.0",
+    description="Standalone server: STT → LLM → TTS (RU / EN / TH)",
+    version="1.4.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # demo; tighten for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================================
-# Health
-# ============================================================
+# Active cancels by session_id (barge-in / cancel)
+active_cancels: Dict[str, CancelToken] = {}
 
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+def _pick_lang_assistant(lang: str):
+    if lang == "en":
+        return assistant_en
+    if lang == "th":
+        return assistant_th
+    return assistant_ru
+
+
+def _fallback_system_prompt(lang: str) -> str:
+    if lang == "th":
+        return (
+            "You are Alina, a helpful voice assistant. Reply in Thai. "
+            "Be concise, structured, and friendly."
+        )
+    if lang == "en":
+        return (
+            "You are Alina, a helpful voice assistant. Reply in English. "
+            "Be concise, structured, and friendly."
+        )
+    return (
+        "Ты — Алина, полезный голосовой ассистент. Отвечай на русском. "
+        "Коротко, структурно и дружелюбно."
+    )
+
+
+def _normalise_lang(lang: str) -> str:
+    lang = (lang or "ru").strip().lower()
+    if lang not in ("ru", "en", "th"):
+        return "ru"
+    return lang
+
+
+def _safe_err_payload(
+    request_id: str,
+    exc: Exception,
+    where: str,
+    trace: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "error": "alina_error",
+        "where": where,
+        "message": str(exc),
+        "request_id": request_id,
+    }
+    if DEBUG_ERRORS and trace:
+        payload["trace"] = trace
+    return payload
+
+
+# ------------------------------------------------------------
+# Global exception handler -> ALWAYS JSON with request_id
+# ------------------------------------------------------------
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+    tb = traceback.format_exc()
+    logger.error("Unhandled error request_id=%s path=%s err=%s", request_id, request.url.path, exc)
+    if DEBUG_ERRORS:
+        logger.error("Trace request_id=%s\n%s", request_id, tb)
+
+    return JSONResponse(
+        status_code=500,
+        content=_safe_err_payload(request_id, exc, where="unhandled_exception_handler", trace=tb),
+    )
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request.state.request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    response = await call_next(request)
+    response.headers["X-Request-Id"] = request.state.request_id
+    return response
+
+
+# ------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "service": "alina"}
 
-# ============================================================
-# Cancel
-# ============================================================
 
 @app.post("/alina/cancel")
-async def cancel(session_id: str = Form(...)):
+async def alina_cancel(session_id: str = Form(...), request: Request = None):  # type: ignore
     tok = active_cancels.get(session_id)
     if tok:
         tok.cancel()
-        return {"status": "cancelled"}
-    return {"status": "not_found"}
+        return {"status": "cancelled", "session_id": session_id, "request_id": request.state.request_id}
+    return {"status": "not_found", "session_id": session_id, "request_id": request.state.request_id}
 
-# ============================================================
-# Helpers
-# ============================================================
 
-def system_prompt(lang: str) -> str:
-    if lang == "th":
-        return "คุณคือ Alina ผู้ช่วยเสียง ตอบเป็นภาษาไทย แบบเป็นมิตร กระชับ และชัดเจน"
-    if lang == "en":
-        return "You are Alina, a helpful voice assistant. Reply in English."
-    return "Ты — Алина, полезный голосовой ассистент. Отвечай по-русски."
+async def _fallback_pipeline(
+    audio_bytes: bytes,
+    filename: str,
+    lang: str,
+    cancel_token: CancelToken,
+    mimetype: Optional[str],
+    request_id: str,
+) -> Dict[str, Any]:
+    """
+    Deepgram async STT -> LLM -> ElevenLabs TTS
+    """
+    # 1) STT (Deepgram) - ASYNC
+    transcript = await transcribe(
+        audio_bytes=audio_bytes,
+        filename=filename,
+        lang=lang,
+        mimetype=mimetype,  # critical for webm/mp3/wav
+    )
 
-# ============================================================
-# MAIN VOICE ENDPOINT
-# ============================================================
+    if cancel_token.cancelled:
+        return {
+            "transcript": transcript,
+            "answer": "",
+            "audio_base64": "",
+            "audio_mime": "audio/mpeg",
+            "history": [],
+            "timings": {"cancelled": True},
+            "request_id": request_id,
+        }
+
+    # 2) LLM
+    messages = [
+        {"role": "system", "content": _fallback_system_prompt(lang)},
+        {"role": "user", "content": transcript or ""},
+    ]
+    answer = chat_with_alina(messages=messages)
+
+    if cancel_token.cancelled:
+        return {
+            "transcript": transcript,
+            "answer": answer,
+            "audio_base64": "",
+            "audio_mime": "audio/mpeg",
+            "history": messages + [{"role": "assistant", "content": answer}],
+            "timings": {"cancelled": True},
+            "request_id": request_id,
+        }
+
+    # 3) TTS
+    audio_mp3 = tts_elevenlabs(answer)
+    audio_b64 = base64.b64encode(audio_mp3).decode("utf-8")
+
+    timings: Dict[str, Any] = {}
+    if assistant_import_error:
+        timings["assistant_import_error"] = str(assistant_import_error)
+
+    return {
+        "transcript": transcript,
+        "answer": answer,
+        "audio_base64": audio_b64,
+        "audio_mime": "audio/mpeg",
+        "history": messages + [{"role": "assistant", "content": answer}],
+        "timings": timings,
+        "request_id": request_id,
+    }
+
 
 @app.post("/alina/voice")
 async def alina_voice(
+    request: Request,
     audio: UploadFile = File(...),
-    lang: str = Form("ru"),
-    session_id: str = Form(""),
+    lang: str = Form("ru"),        # "ru" | "en" | "th"
+    session_id: str = Form(""),    # comes from frontend
 ):
-    if not audio:
-        raise HTTPException(400, "No audio file")
+    """
+    Full voice cycle:
+      STT -> LLM -> TTS
+    Returns JSON:
+      { transcript, answer, audio_base64, audio_mime, history, timings, session_id, request_id }
+    """
+    request_id = request.state.request_id
+    lang = _normalise_lang(lang)
 
-    audio_bytes = await audio.read()_
+    # read
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail={"error": "empty_audio", "request_id": request_id})
+
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "error": "audio_too_large",
+                "max_mb": MAX_AUDIO_MB,
+                "size_bytes": len(audio_bytes),
+                "request_id": request_id,
+            },
+        )
+
+    if not session_id:
+        session_id = str(uuid.uuid4())
+
+    cancel_token = CancelToken(False)
+    active_cancels[session_id] = cancel_token
+
+    filename = audio.filename or "audio.wav"
+    mimetype = audio.content_type  # e.g. audio/webm, audio/mpeg, audio/wav
+
+    logger.info(
+        "VOICE request_id=%s session_id=%s lang=%s filename=%s mimetype=%s bytes=%d",
+        request_id, session_id, lang, filename, mimetype, len(audio_bytes)
+    )
+
+    try:
+        # Optional primary assistant path (OFF by default)
+        if USE_ASSISTANT and assistant_ru is not None:
+            assistant = _pick_lang_assistant(lang)
+            if assistant is None:
+                raise RuntimeError("Assistant not initialised")
+
+            # NOTE: If assistant internally calls async STT incorrectly -> it can 500.
+            # Keep this path OFF until stable.
+            result = assistant.handle_user_audio(
+                audio_bytes,
+                filename,
+                cancel_token=cancel_token,
+                use_llm_stream=True,
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError("assistant.handle_user_audio must return dict")
+            result["request_id"] = request_id
+
+        # Stable fallback path
+        else:
+            result = await _fallback_pipeline(
+                audio_bytes=audio_bytes,
+                filename=filename,
+                lang=lang,
+                cancel_token=cancel_token,
+                mimetype=mimetype,
+                request_id=request_id,
+            )
+
+        result["session_id"] = session_id
+        return JSONResponse(content=result)
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error("VOICE failed request_id=%s err=%s", request_id, e)
+        if DEBUG_ERRORS:
+            logger.error("Trace request_id=%s\n%s", request_id, tb)
+
+        # Always JSON so DevTools Response shows useful detail
+        raise HTTPException(
+            status_code=500,
+            detail=_safe_err_payload(request_id, e, where="/alina/voice", trace=tb),
+        )
+
+    finally:
+        active_cancels.pop(session_id, None)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    # Keep your UI as-is
+    html = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Alina – голосовой ассистент</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f7; margin: 0; padding: 20px; }
+    h1 { margin-bottom: 4px; }
+    .subtitle { color: #777; margin-bottom: 20px; }
+    .card { background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 2px 6px rgba(0,0,0,0.05); margin-bottom: 20px; }
+    .btn { padding: 8px 16px; border-radius: 8px; border: 1px solid #ccc; cursor: pointer; background: #fff; font-size: 14px; }
+    .btn-primary { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+    .btn-primary:disabled, .btn:disabled { opacity: 0.5; cursor: default; }
+    .status-ok { color: #1a7f37; font-size: 14px; margin-left: 8px; }
+    .status-error { color: #d93025; font-size: 14px; margin-left: 8px; }
+    #reply-chat div.bubble { margin-bottom: 10px; }
+    .bubble-header { font-size: 13px; color: #666; margin-bottom: 2px; }
+    .bubble-user { display: inline-block; background: #e8f0fe; border-radius: 12px; padding: 8px 12px; max-width: 100%; }
+    .bubble-alina { display: inline-block; background: #f1f3f4; border-radius: 12px; padding: 8px 12px; max-width: 100%; }
+    pre { background: #f6f6f6; border-radius: 8px; padding: 10px; font-size: 12px; overflow-x: auto; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+    .pill { font-size:12px; background:#f1f3f4; padding:6px 10px; border-radius:999px; color:#333; }
+  </style>
+</head>
+<body>
+  <h1 id="ui-title">Alina – голосовой ассистент</h1>
+  <div class="subtitle" id="ui-subtitle">Отдельный сервер: STT → LLM → TTS (RU / EN / TH)</div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between;">
+      <h3 id="ui-step1" style="margin:0;">Шаг 1. Запиши или выбери аудиофайл</h3>
+      <span class="pill" id="ui-session">session: —</span>
+    </div>
+
+    <div style="margin: 12px 0 10px;">
+      <input type="file" id="audio-file" accept="audio/*" />
+      <span id="ui-hint" style="font-size: 12px; color:#777; margin-left:8px;">
+        Можно выбрать готовый аудиофайл или записать голос с микрофона прямо в браузере.
+      </span>
+    </div>
+
+    <div style="margin-bottom: 10px;">
+      <button class="btn" id="btn-start">🎤 Начать запись</button>
+      <button class="btn" id="btn-stop" disabled>⏹ Остановить запись</button>
+      <span id="record-status" style="margin-left: 8px; font-size: 14px; color: #555;"></span>
+    </div>
+
+    <h3 id="ui-step2">Шаг 2. Отправь запрос Алине</h3>
+
+    <div style="margin-bottom: 10px;">
+      <label style="margin-right: 10px;">
+        <input type="radio" name="lang" value="ru" checked />
+        🇷🇺 RU
+      </label>
+      <label style="margin-right: 10px;">
+        <input type="radio" name="lang" value="en" />
+        🇬🇧 EN
+      </label>
+      <label>
+        <input type="radio" name="lang" value="th" />
+        🇹🇭 TH
+      </label>
+    </div>
+
+    <button class="btn btn-primary" id="btn-send">Отправить Алине</button>
+    <span id="send-status"></span>
+
+    <div style="margin-top: 12px;">
+      <pre id="ui-timings" style="display:none;"></pre>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 id="ui-answer">Ответ Алины</h3>
+    <audio id="reply-audio" controls style="width: 100%; margin-bottom: 10px;"></audio>
+
+    <div id="reply-chat" style="margin-bottom: 12px;"></div>
+
+    <pre id="reply-history" style="display:none;"></pre>
+  </div>
+
+  <script>
+    const I18N = {
+      ru: { title:"Alina – голосовой ассистент", subtitle:"Отдельный сервер: STT → LLM → TTS (RU / EN / TH)",
+        step1:"Шаг 1. Запиши или выбери аудиофайл",
+        hint:"Можно выбрать готовый аудиофайл или записать голос с микрофона прямо в браузере.",
+        step2:"Шаг 2. Отправь запрос Алине", send:"Отправить Алине", answer:"Ответ Алины",
+        rec:"Запись идёт…", recDone:"Запись завершена. Теперь можно отправить Алине.",
+        micErr:"Не удалось получить доступ к микрофону.", sending:"Отправка…", done:"Готово ✔", err:"Ошибка ✖" },
+      en: { title:"Alina – voice assistant", subtitle:"Standalone server: STT → LLM → TTS (RU / EN / TH)",
+        step1:"Step 1. Record or choose an audio file",
+        hint:"You can select an audio file or record from the microphone directly in the browser.",
+        step2:"Step 2. Send a request to Alina", send:"Send to Alina", answer:"Alina's reply",
+        rec:"Recording…", recDone:"Recording finished. You can now send it to Alina.",
+        micErr:"Microphone access error.", sending:"Sending…", done:"Done ✔", err:"Error ✖" },
+      th: { title:"Alina – ผู้ช่วยเสียง", subtitle:"เซิร์ฟเวอร์เดี่ยว: STT → LLM → TTS (RU / EN / TH)",
+        step1:"ขั้นตอนที่ 1 บันทึกเสียงหรือเลือกไฟล์เสียง",
+        hint:"คุณสามารถเลือกไฟล์เสียง หรือบันทึกเสียงจากไมโครโฟนในเบราว์เซอร์ได้",
+        step2:"ขั้นตอนที่ 2 ส่งคำถามให้ Alina", send:"ส่งให้ Alina", answer:"คำตอบของ Alina",
+        rec:"กำลังบันทึก…", recDone:"บันทึกเสร็จแล้ว พร้อมส่งให้ Alina",
+        micErr:"ไม่สามารถเข้าถึงไมโครโฟนได้", sending:"กำลังส่ง…", done:"เสร็จสิ้น ✔", err:"เกิดข้อผิดพลาด ✖" }
+    };
+
+    function getUILang(){ return document.querySelector('input[name="lang"]:checked').value || "ru"; }
+    function applyUI(lang){
+      const t = I18N[lang] || I18N.ru;
+      document.getElementById("ui-title").textContent = t.title;
+      document.getElementById("ui-subtitle").textContent = t.subtitle;
+      document.getElementById("ui-step1").textContent = t.step1;
+      document.getElementById("ui-hint").textContent = t.hint;
+      document.getElementById("ui-step2").textContent = t.step2;
+      document.getElementById("btn-send").textContent = t.send;
+      document.getElementById("ui-answer").textContent = t.answer;
+    }
+
+    let mediaRecorder=null, recordedChunks=[];
+    let sessionId=(crypto&&crypto.randomUUID)?crypto.randomUUID():String(Date.now());
+
+    const btnStart=document.getElementById("btn-start");
+    const btnStop=document.getElementById("btn-stop");
+    const recordStatus=document.getElementById("record-status");
+    const btnSend=document.getElementById("btn-send");
+    const sendStatus=document.getElementById("send-status");
+    const audioFileInput=document.getElementById("audio-file");
+    const replyAudio=document.getElementById("reply-audio");
+    const replyChat=document.getElementById("reply-chat");
+    const replyHistory=document.getElementById("reply-history");
+    const uiTimings=document.getElementById("ui-timings");
+    const uiSession=document.getElementById("ui-session");
+
+    uiSession.textContent="session: "+sessionId;
+    applyUI(getUILang());
+    document.querySelectorAll('input[name="lang"]').forEach(r=>r.addEventListener("change",()=>applyUI(getUILang())));
+
+    async function cancelServerIfNeeded(){
+      const fd=new FormData(); fd.append("session_id", sessionId);
+      try{ await fetch("/alina/cancel",{method:"POST",body:fd}); }catch(e){}
+    }
+
+    btnStart.onclick=async ()=>{
+      recordedChunks=[]; recordStatus.textContent="";
+      try{ replyAudio.pause(); replyAudio.currentTime=0; replyAudio.src=""; }catch(e){}
+      await cancelServerIfNeeded();
+      try{
+        const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+        mediaRecorder=new MediaRecorder(stream);
+        mediaRecorder.ondataavailable=(e)=>{ if(e.data.size>0) recordedChunks.push(e.data); };
+        mediaRecorder.onstop=()=>{ const t=I18N[getUILang()]||I18N.ru; recordStatus.textContent=t.recDone; };
+        mediaRecorder.start();
+        btnStart.disabled=true; btnStop.disabled=false;
+        const t=I18N[getUILang()]||I18N.ru; recordStatus.textContent=t.rec;
+      }catch(err){
+        console.error(err);
+        const t=I18N[getUILang()]||I18N.ru; recordStatus.textContent=t.micErr;
+      }
+    };
+
+    btnStop.onclick=()=>{
+      if(mediaRecorder && mediaRecorder.state!=="inactive"){
+        mediaRecorder.stop();
+        btnStart.disabled=false; btnStop.disabled=true;
+      }
+    };
+
+    btnSend.onclick=async ()=>{
+      const t=I18N[getUILang()]||I18N.ru;
+      sendStatus.textContent=""; sendStatus.className="";
+      uiTimings.style.display="none"; uiTimings.textContent="";
+
+      let audioBlob=null, filename="audio.wav";
+      if(recordedChunks.length>0){
+        audioBlob=new Blob(recordedChunks,{type:"audio/webm"});
+        filename="recording.webm";
+      }else{
+        const file=audioFileInput.files[0];
+        if(!file){ alert(t.hint); return; }
+        audioBlob=file; filename=file.name||"audio.wav";
+      }
+
+      const formData=new FormData();
+      formData.append("audio", audioBlob, filename);
+      const lang=document.querySelector('input[name="lang"]:checked').value;
+      formData.append("lang", lang);
+      formData.append("session_id", sessionId);
+
+      btnSend.disabled=true;
+      sendStatus.textContent=t.sending;
+
+      try{
+        const resp=await fetch("/alina/voice",{method:"POST",body:formData});
+        const data=await resp.json().catch(()=>null);
+        if(!resp.ok){
+          // show full detail for debugging
+          throw new Error((data && data.detail) ? JSON.stringify(data.detail) : ("HTTP "+resp.status));
+        }
+
+        if(data.session_id){ sessionId=data.session_id; uiSession.textContent="session: "+sessionId; }
+
+        if(data.audio_base64){
+          const mime=data.audio_mime||"audio/mpeg";
+          replyAudio.src=`data:${mime};base64,${data.audio_base64}`;
+          replyAudio.load();
+        }
+
+        replyChat.innerHTML="";
+        if(data.transcript){
+          const div=document.createElement("div");
+          div.className="bubble";
+          div.innerHTML=`<div class="bubble-header">👤</div><div class="bubble-user">${String(data.transcript).replace(/\\n/g,"<br>")}</div>`;
+          replyChat.appendChild(div);
+        }
+        if(data.answer){
+          const div=document.createElement("div");
+          div.className="bubble";
+          div.innerHTML=`<div class="bubble-header">🤖</div><div class="bubble-alina">${String(data.answer).replace(/\\n/g,"<br>")}</div>`;
+          replyChat.appendChild(div);
+        }
+
+        replyHistory.style.display="block";
+        replyHistory.textContent="История диалога (history):\\n"+JSON.stringify(data.history,null,2);
+
+        if(data.timings){
+          uiTimings.style.display="block";
+          uiTimings.textContent="timings:\\n"+JSON.stringify(data.timings,null,2);
+        }
+
+        sendStatus.textContent=t.done; sendStatus.className="status-ok";
+      }catch(err){
+        console.error(err);
+        sendStatus.textContent=t.err; sendStatus.className="status-error";
+        // Optional: show error text to user for debugging
+        uiTimings.style.display="block";
+        uiTimings.textContent="client_error:\\n"+String(err);
+      }finally{
+        btnSend.disabled=false;
+      }
+    };
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
