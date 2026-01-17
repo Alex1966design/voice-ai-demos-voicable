@@ -1,11 +1,10 @@
 # backend/alina_server.py
 """
 Alina Voice Assistant (FastAPI)
-
 Routes:
-  - GET  /health         -> JSON healthcheck
+  - GET  /health         -> JSON healthcheck (for Railway / LB)
   - GET  /               -> HTML UI (RU / EN / TH)
-  - POST /alina/voice    -> STT -> LLM -> TTS pipeline
+  - POST /alina/voice    -> STT -> LLM -> TTS pipeline (production-safe)
   - POST /alina/cancel   -> cancel in-flight generation for a session_id (best-effort)
 
 Railway start command (repo root):
@@ -15,38 +14,37 @@ Railway start command (repo root):
 from __future__ import annotations
 
 import base64
-import logging
+import json
 import os
 import traceback
 import uuid
-import inspect
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-# -----------------------------
-# Logging (Railway-friendly)
-# -----------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("alina_server")
+# ---------------------------
+# Configuration
+# ---------------------------
+# 0 = do not include stacktrace in HTTP response (safe default)
+# 1 = include stacktrace (use for debugging; do NOT keep enabled publicly)
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "0").strip() == "1"
 
-DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"
-USE_ASSISTANT = os.getenv("USE_ASSISTANT", "0") == "1"
-USE_FALLBACK_PIPELINE = os.getenv("USE_FALLBACK_PIPELINE", "0") == "1"
+# Force fallback pipeline (recommended until assistant.alina is proven compatible)
+# 1 = always use fallback STT/LLM/TTS
+FORCE_FALLBACK = os.getenv("FORCE_FALLBACK", "1").strip() == "1"
 
-# -----------------------------
-# Cancel token (fallback safe)
-# -----------------------------
+# Limit max uploaded audio size to avoid memory abuse (in bytes).
+# Default: 12 MB. Adjust if needed.
+MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(12 * 1024 * 1024)))
+
+# ---------------------------
+# Cancel token
+# ---------------------------
 try:
     from assistant.llm_client import CancelToken  # type: ignore
 except Exception:
-
     class CancelToken:
         def __init__(self, cancelled: bool = False):
             self.cancelled = cancelled
@@ -55,40 +53,28 @@ except Exception:
             self.cancelled = True
 
 
-# -----------------------------
-# Optional assistant import
-# -----------------------------
+# ---------------------------
+# Optional: your assistant (kept, but not used by default)
+# ---------------------------
 assistant_import_error: Optional[Exception] = None
 assistant_ru = assistant_en = assistant_th = None
-
-if USE_ASSISTANT and not USE_FALLBACK_PIPELINE:
-    try:
-        from assistant.alina import AlinaAssistant  # type: ignore
-
-        assistant_ru = AlinaAssistant(mode="ru")
-        assistant_en = AlinaAssistant(mode="en")
-        assistant_th = AlinaAssistant(mode="th")
-        logger.info("AlinaAssistant imported and initialised (USE_ASSISTANT=1).")
-    except Exception as e:
-        assistant_import_error = e
-        assistant_ru = assistant_en = assistant_th = None
-        logger.exception("Failed to import/init AlinaAssistant; will use fallback pipeline.")
-
-
-# -----------------------------
-# Fallback pipeline imports
-# -----------------------------
-# These must exist in your repo.
 try:
-    from assistant.stt_client import transcribe  # type: ignore
-    from assistant.llm_client import chat_with_alina  # type: ignore
-    from assistant.elevenlabs_client import tts_elevenlabs  # type: ignore
-
-    FALLBACK_IMPORT_OK = True
+    from assistant.alina import AlinaAssistant  # type: ignore
+    assistant_ru = AlinaAssistant(mode="ru")
+    assistant_en = AlinaAssistant(mode="en")
+    assistant_th = AlinaAssistant(mode="th")
 except Exception as e:
-    FALLBACK_IMPORT_OK = False
-    fallback_import_error = e
-    logger.exception("Fallback pipeline imports failed. Check assistant/* modules.")
+    assistant_import_error = e
+    assistant_ru = assistant_en = assistant_th = None
+
+
+# ---------------------------
+# Fallback pipeline imports (must exist in repo)
+# ---------------------------
+# IMPORTANT: transcribe is async (Deepgram)
+from assistant.stt_client import transcribe  # type: ignore
+from assistant.llm_client import chat_with_alina  # type: ignore
+from assistant.elevenlabs_client import tts_elevenlabs  # type: ignore
 
 
 app = FastAPI(
@@ -109,6 +95,9 @@ app.add_middleware(
 active_cancels: Dict[str, CancelToken] = {}
 
 
+# ---------------------------
+# Helpers
+# ---------------------------
 def _pick_lang_assistant(lang: str):
     if lang == "en":
         return assistant_en
@@ -134,27 +123,48 @@ def _fallback_system_prompt(lang: str) -> str:
     )
 
 
-def _normalize_mimetype(upload_mime: Optional[str], filename: str) -> Optional[str]:
+def _safe_err_payload(e: Exception) -> Dict[str, Any]:
     """
-    Browser MediaRecorder usually sends audio/webm (opus). Deepgram supports it,
-    but sometimes content_type might be empty/odd. We normalize it.
+    Production-safe error payload.
+    If DEBUG_ERRORS=1, includes traceback.
     """
-    if upload_mime:
-        # Remove optional params like codecs=opus for maximum compatibility if needed
-        return upload_mime.split(";")[0].strip().lower()
+    payload: Dict[str, Any] = {
+        "error": True,
+        "message": f"{type(e).__name__}: {str(e)}",
+    }
+    if DEBUG_ERRORS:
+        payload["traceback"] = traceback.format_exc()
+    return payload
 
-    name = (filename or "").lower()
-    if name.endswith(".webm"):
-        return "audio/webm"
-    if name.endswith(".wav"):
-        return "audio/wav"
-    if name.endswith(".mp3"):
-        return "audio/mpeg"
-    if name.endswith(".m4a"):
-        return "audio/mp4"
-    if name.endswith(".mp4"):
-        return "audio/mp4"
-    return None
+
+def _normalise_lang(lang: str) -> str:
+    lang = (lang or "ru").strip().lower()
+    if lang not in ("ru", "en", "th"):
+        return "ru"
+    return lang
+
+
+def _audio_meta(audio: UploadFile) -> Dict[str, Any]:
+    return {
+        "filename": audio.filename,
+        "content_type": getattr(audio, "content_type", None),
+    }
+
+
+async def _read_audio_limited(audio: UploadFile) -> bytes:
+    """
+    Read upload safely with a max size cap.
+    UploadFile.read() reads whole content to memory, so we enforce a cap.
+    """
+    data = await audio.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty audio file")
+    if len(data) > MAX_AUDIO_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Audio too large ({len(data)} bytes). Max is {MAX_AUDIO_BYTES} bytes.",
+        )
+    return data
 
 
 async def _fallback_pipeline(
@@ -162,30 +172,20 @@ async def _fallback_pipeline(
     filename: str,
     lang: str,
     cancel_token: CancelToken,
-    mimetype: Optional[str],
-    request_id: str,
+    mimetype: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     STT (Deepgram async) -> LLM -> TTS (ElevenLabs)
     """
-    if not FALLBACK_IMPORT_OK:
-        raise RuntimeError(f"Fallback pipeline imports failed: {fallback_import_error}")
 
-    logger.info(
-        "[%s] fallback_pipeline: filename=%s mimetype=%s lang=%s bytes=%d",
-        request_id,
-        filename,
-        mimetype,
-        lang,
-        len(audio_bytes),
-    )
+    timings: Dict[str, Any] = {}
 
     # 1) STT (Deepgram) - ASYNC
     transcript = await transcribe(
         audio_bytes=audio_bytes,
         filename=filename,
         lang=lang,
-        mimetype=mimetype,
+        mimetype=mimetype,  # IMPORTANT: webm/mp3/wav
     )
 
     if cancel_token.cancelled:
@@ -195,7 +195,7 @@ async def _fallback_pipeline(
             "audio_base64": "",
             "audio_mime": "audio/mpeg",
             "history": [],
-            "timings": {"cancelled": True},
+            "timings": {**timings, "cancelled": True},
         }
 
     # 2) LLM
@@ -212,7 +212,7 @@ async def _fallback_pipeline(
             "audio_base64": "",
             "audio_mime": "audio/mpeg",
             "history": messages + [{"role": "assistant", "content": answer}],
-            "timings": {"cancelled": True},
+            "timings": {**timings, "cancelled": True},
         }
 
     # 3) TTS
@@ -225,24 +225,22 @@ async def _fallback_pipeline(
         "audio_base64": audio_b64,
         "audio_mime": "audio/mpeg",
         "history": messages + [{"role": "assistant", "content": answer}],
-        "timings": {},
+        "timings": timings,
     }
 
 
+# ---------------------------
+# Routes
+# ---------------------------
 @app.get("/health")
 async def health():
-    """
-    Quick diagnostics for Railway:
-    - shows which pipeline is active
-    - does not leak keys
-    """
     return {
         "status": "ok",
         "service": "alina",
-        "use_assistant": bool(assistant_ru is not None),
-        "use_fallback_pipeline": USE_FALLBACK_PIPELINE or (assistant_ru is None),
         "debug_errors": DEBUG_ERRORS,
-        "log_level": LOG_LEVEL,
+        "force_fallback": FORCE_FALLBACK,
+        "assistant_available": bool(assistant_ru is not None),
+        "assistant_import_error": str(assistant_import_error) if assistant_import_error else "",
     }
 
 
@@ -259,23 +257,21 @@ async def alina_cancel(session_id: str = Form(...)):
 async def alina_voice(
     request: Request,
     audio: UploadFile = File(...),
-    lang: str = Form("ru"),        # "ru" | "en" | "th"
-    session_id: str = Form(""),    # comes from frontend
+    lang: str = Form("ru"),
+    session_id: str = Form(""),
 ):
     """
     Full voice cycle:
       STT -> LLM -> TTS
     Returns JSON:
       { transcript, answer, audio_base64, audio_mime, history, timings, session_id }
+
+    Production-safe:
+      - size cap
+      - always returns JSON (even on errors)
+      - optional debug traceback when DEBUG_ERRORS=1
     """
-    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
-
-    if lang not in ("ru", "en", "th"):
-        raise HTTPException(status_code=400, detail=f"Unsupported lang: {lang}")
-
-    audio_bytes = await audio.read()
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="Empty audio file")
+    lang = _normalise_lang(lang)
 
     if not session_id:
         session_id = str(uuid.uuid4())
@@ -283,91 +279,91 @@ async def alina_voice(
     cancel_token = CancelToken(False)
     active_cancels[session_id] = cancel_token
 
-    filename = audio.filename or "audio.webm"
-    mimetype = _normalize_mimetype(audio.content_type, filename)
-
-    logger.info(
-        "[%s] /alina/voice start: session_id=%s lang=%s filename=%s upload_mime=%s norm_mime=%s bytes=%d",
-        request_id,
-        session_id,
-        lang,
-        filename,
-        audio.content_type,
-        mimetype,
-        len(audio_bytes),
-    )
-
     try:
-        # Prefer fallback unless assistant is explicitly enabled and initialised
-        should_use_fallback = USE_FALLBACK_PIPELINE or (assistant_ru is None)
+        audio_bytes = await _read_audio_limited(audio)
 
-        if not should_use_fallback:
-            assistant = _pick_lang_assistant(lang)
-            if assistant is None:
-                raise RuntimeError("Assistant not initialised")
+        filename = audio.filename or "audio.wav"
+        mimetype = getattr(audio, "content_type", None) or "application/octet-stream"
 
-            # Support both sync and async handle_user_audio
-            handle = getattr(assistant, "handle_user_audio", None)
-            if handle is None:
-                raise RuntimeError("Assistant has no handle_user_audio()")
+        # For troubleshooting: include minimal request meta in timings
+        timings: Dict[str, Any] = {
+            "session_id": session_id,
+            "lang": lang,
+            "upload": {
+                "filename": filename,
+                "content_type": mimetype,
+                "size_bytes": len(audio_bytes),
+            },
+        }
 
-            result = handle(
-                audio_bytes,
-                filename,
-                cancel_token=cancel_token,
-                use_llm_stream=True,
-                lang=lang,
-                mimetype=mimetype,
-            )
+        # Always prefer fallback unless explicitly disabled
+        use_fallback = FORCE_FALLBACK or (assistant_ru is None)
 
-            if inspect.isawaitable(result):
-                result = await result  # type: ignore
-
-            if not isinstance(result, dict):
-                raise RuntimeError("assistant.handle_user_audio must return dict")
-
-        else:
+        if use_fallback:
             result = await _fallback_pipeline(
                 audio_bytes=audio_bytes,
                 filename=filename,
                 lang=lang,
                 cancel_token=cancel_token,
                 mimetype=mimetype,
-                request_id=request_id,
             )
             result.setdefault("timings", {})
+            # Merge timings (keep pipeline timings if any)
+            result["timings"] = {**timings, **(result.get("timings") or {})}
             if assistant_import_error:
                 result["timings"]["assistant_import_error"] = str(assistant_import_error)
+        else:
+            # Secondary path: your AlinaAssistant (only when FORCE_FALLBACK=0)
+            assistant = _pick_lang_assistant(lang)
+            if assistant is None:
+                raise RuntimeError("Assistant not initialised")
+
+            # NOTE: If assistant.handle_user_audio is sync, it can block.
+            # For now we keep it sync; if needed, wrap in anyio.to_thread.run_sync later.
+            result = assistant.handle_user_audio(
+                audio_bytes,
+                filename,
+                cancel_token=cancel_token,
+                use_llm_stream=True,
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError("assistant.handle_user_audio must return dict")
+
+            result.setdefault("timings", {})
+            result["timings"] = {**timings, **(result.get("timings") or {})}
 
         result["session_id"] = session_id
-        result["request_id"] = request_id
-
-        logger.info("[%s] /alina/voice success: session_id=%s", request_id, session_id)
         return JSONResponse(content=result)
 
-    except HTTPException:
-        raise
+    except HTTPException as he:
+        # Ensure JSON error response (so DevTools → Response shows details)
+        payload = {"detail": he.detail, "status_code": he.status_code}
+        if DEBUG_ERRORS:
+            payload["debug"] = {
+                "request_headers": dict(request.headers),
+                "audio_meta": _audio_meta(audio),
+            }
+        return JSONResponse(status_code=he.status_code, content=payload)
 
     except Exception as e:
-        tb = traceback.format_exc()
-        logger.error("[%s] /alina/voice ERROR: %s", request_id, str(e))
-        logger.error("[%s] traceback:\n%s", request_id, tb)
-
-        # Return informative error (so you can see it in DevTools -> Network -> Response)
+        # Always JSON error response
+        payload = _safe_err_payload(e)
+        payload["session_id"] = session_id
         if DEBUG_ERRORS:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Alina error: {e}\n---\n{tb}",
-            )
-        raise HTTPException(status_code=500, detail=f"Alina error: {e}")
+            payload["debug"] = {
+                "audio_meta": _audio_meta(audio),
+            }
+        return JSONResponse(status_code=500, content=payload)
 
     finally:
         active_cancels.pop(session_id, None)
 
 
+# ---------------------------
+# UI (unchanged)
+# ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    # UI: your current HTML (unchanged)
     html = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -559,11 +555,12 @@ async def index():
 
       try{
         const resp=await fetch("/alina/voice",{method:"POST",body:formData});
+        const data=await resp.json().catch(()=>({}));
         if(!resp.ok){
-          const errData=await resp.json().catch(()=>({}));
-          throw new Error(errData.detail || ("HTTP "+resp.status));
+          // show server JSON error in console
+          console.error("Server error:", data);
+          throw new Error((data && (data.detail || data.message)) || ("HTTP "+resp.status));
         }
-        const data=await resp.json();
 
         if(data.session_id){ sessionId=data.session_id; uiSession.textContent="session: "+sessionId; }
 
