@@ -1,6 +1,7 @@
 # backend/alina_server.py
 """
 Alina Voice Assistant (FastAPI)
+
 Routes:
   - GET  /health         -> JSON healthcheck (for Railway / LB)
   - GET  /               -> HTML UI (RU / EN / TH)
@@ -9,6 +10,13 @@ Routes:
 
 Railway start command (repo root):
   uvicorn backend.alina_server:app --host 0.0.0.0 --port $PORT
+
+IMPORTANT (фикс вашей ошибки 500):
+- Для браузерной записи MediaRecorder обычно шлёт audio/webm.
+- Ваш кастомный AlinaAssistant (assistant.handle_user_audio) часто не умеет webm и не принимает mimetype.
+- Поэтому по умолчанию мы принудительно используем fallback pipeline:
+    Deepgram (async, с mimetype) -> LLM -> ElevenLabs TTS
+- Если захотите вернуть AlinaAssistant, поставьте env: USE_ALINA_ASSISTANT=1
 """
 
 from __future__ import annotations
@@ -23,7 +31,10 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-# --- Cancel token (safe fallback if not present elsewhere) ---
+
+# -----------------------------
+# Cancel token (safe fallback)
+# -----------------------------
 try:
     from assistant.llm_client import CancelToken  # type: ignore
 except Exception:
@@ -35,29 +46,43 @@ except Exception:
             self.cancelled = True
 
 
-# --- Try to use your existing assistant; otherwise fall back to direct pipeline ---
-assistant_import_error = None
-try:
-    from assistant.alina import AlinaAssistant  # type: ignore
+# -----------------------------
+# Fallback pipeline imports
+# -----------------------------
+# ВАЖНО: transcribe должен быть async и принимать mimetype.
+# Ожидаем сигнатуру:
+#   await transcribe(audio_bytes=..., filename=..., lang=..., mimetype=...)
+#
+# Если у вас другой файл для Deepgram (например deepgram_client.py),
+# просто сделайте в assistant/stt_client.py прокладку на него с такой сигнатурой.
+from assistant.stt_client import transcribe  # type: ignore
+from assistant.llm_client import chat_with_alina  # type: ignore
+from assistant.elevenlabs_client import tts_elevenlabs  # type: ignore
 
-    assistant_ru = AlinaAssistant(mode="ru")
-    assistant_en = AlinaAssistant(mode="en")
-    assistant_th = AlinaAssistant(mode="th")
-except Exception as e:
-    assistant_import_error = e
-    assistant_ru = assistant_en = assistant_th = None  # type: ignore
 
-    # fallback pipeline imports (must exist in your repo)
-    # IMPORTANT: transcribe is async now (Deepgram)
-    from assistant.stt_client import transcribe  # type: ignore
-    from assistant.llm_client import chat_with_alina  # type: ignore
-    from assistant.elevenlabs_client import tts_elevenlabs  # type: ignore
+# -----------------------------
+# Optional: try AlinaAssistant
+# -----------------------------
+USE_ALINA_ASSISTANT = os.getenv("USE_ALINA_ASSISTANT", "0").strip() == "1"
+assistant_import_error: Optional[Exception] = None
+assistant_ru = assistant_en = assistant_th = None
+
+if USE_ALINA_ASSISTANT:
+    try:
+        from assistant.alina import AlinaAssistant  # type: ignore
+
+        assistant_ru = AlinaAssistant(mode="ru")
+        assistant_en = AlinaAssistant(mode="en")
+        assistant_th = AlinaAssistant(mode="th")
+    except Exception as e:
+        assistant_import_error = e
+        assistant_ru = assistant_en = assistant_th = None
 
 
 app = FastAPI(
     title="Alina Voice Assistant",
     description="Standalone server: STT → LLM → TTS (RU / EN / TH)",
-    version="1.3.0",
+    version="1.3.1",
 )
 
 app.add_middleware(
@@ -119,10 +144,10 @@ async def _fallback_pipeline(
     mimetype: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    If assistant.alina is unavailable, we do:
+    Fallback pipeline:
       STT (Deepgram async) -> LLM -> TTS (ElevenLabs)
     """
-    # 1) STT (Deepgram) - ASYNC
+    # 1) STT (Deepgram) - ASYNC + mimetype
     transcript = await transcribe(
         audio_bytes=audio_bytes,
         filename=filename,
@@ -143,7 +168,7 @@ async def _fallback_pipeline(
     # 2) LLM
     messages = [
         {"role": "system", "content": _fallback_system_prompt(lang)},
-        {"role": "user", "content": transcript or ""},
+        {"role": "user", "content": (transcript or "").strip()},
     ]
     answer = chat_with_alina(messages=messages)
 
@@ -180,6 +205,7 @@ async def alina_voice(
     """
     Full voice cycle:
       STT -> LLM -> TTS
+
     Returns JSON:
       { transcript, answer, audio_base64, audio_mime, history, timings, session_id }
     """
@@ -194,17 +220,18 @@ async def alina_voice(
     active_cancels[session_id] = cancel_token
 
     filename = audio.filename or "audio.wav"
-    mimetype = audio.content_type  # important for Deepgram (webm/mp3/wav)
+    mimetype = audio.content_type  # IMPORTANT for Deepgram (webm/mp3/wav)
 
     try:
-        # Primary path: your AlinaAssistant implementation
-        if assistant_ru is not None:
+        # По умолчанию используем Fallback (Deepgram) — это фикс для audio/webm из браузера.
+        # AlinaAssistant включается только если USE_ALINA_ASSISTANT=1
+        if USE_ALINA_ASSISTANT and assistant_ru is not None:
             assistant = _pick_lang_assistant(lang)
             if assistant is None:
                 raise RuntimeError("Assistant not initialised")
 
-            # If your assistant supports async, you can upgrade later.
-            # For now keep sync.
+            # ВАЖНО: если ваш assistant не умеет webm, он упадёт.
+            # Тогда просто оставляйте USE_ALINA_ASSISTANT=0.
             result = assistant.handle_user_audio(
                 audio_bytes,
                 filename,
@@ -214,11 +241,22 @@ async def alina_voice(
             if not isinstance(result, dict):
                 raise RuntimeError("assistant.handle_user_audio must return dict")
 
-        # Fallback path if assistant import failed
-        else:
-            result = await _fallback_pipeline(audio_bytes, filename, lang, cancel_token, mimetype=mimetype)
+            # Чтобы вы видели в ответе, какой путь сработал
             result.setdefault("timings", {})
-            result["timings"]["assistant_import_error"] = str(assistant_import_error)
+            result["timings"]["path"] = "assistant"
+
+        else:
+            result = await _fallback_pipeline(
+                audio_bytes=audio_bytes,
+                filename=filename,
+                lang=lang,
+                cancel_token=cancel_token,
+                mimetype=mimetype,
+            )
+            result.setdefault("timings", {})
+            result["timings"]["path"] = "fallback_deepgram"
+            if assistant_import_error:
+                result["timings"]["assistant_import_error"] = str(assistant_import_error)
 
         result["session_id"] = session_id
         return JSONResponse(content=result)
@@ -227,8 +265,8 @@ async def alina_voice(
         raise
 
     except Exception as e:
-        # Make 500 *informative* for you in DevTools
-        debug = os.getenv("DEBUG_ERRORS", "1") == "1"
+        # Делает 500 информативной для DevTools / диагностики
+        debug = os.getenv("DEBUG_ERRORS", "1").strip() == "1"
         if debug:
             tb = traceback.format_exc()
             raise HTTPException(
@@ -243,7 +281,7 @@ async def alina_voice(
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    # UI unchanged (your current HTML). Keep as-is.
+    # UI: оставляем как у вас (без изменений)
     html = """<!DOCTYPE html>
 <html lang="ru">
 <head>
