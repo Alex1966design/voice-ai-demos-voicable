@@ -1,211 +1,252 @@
-# backend/assistant/stt_client.py
+# assistant/stt_client.py
 """
-STT client (Deepgram) — production-safe, async-friendly.
+STT client (Deepgram) - production-safe
 
-Key goals:
-- Stable function contract: transcribe(audio_bytes, filename, lang, mimetype, **kwargs)
-- Never crash on unexpected kwargs (A+B “неубиваемость”)
-- Do not block FastAPI event loop: run requests in threadpool
-- Strong debug logging WITHOUT leaking secrets
+Goals:
+- Keep API stable for callers: transcribe(audio_bytes, filename, lang=..., mimetype=...)
+- Accept extra kwargs without crashing (A: compatibility layer)
+- Use Deepgram SDK if available, otherwise REST fallback (B: resilience)
+- Provide actionable errors and minimal logging hooks
 
 ENV:
-  DEEPGRAM_API_KEY (required)
-  DEEPGRAM_MODEL (optional, default: nova-2)
-  DEEPGRAM_TIER (optional, default: standard)
-  DEEPGRAM_PUNCTUATE (optional, default: true)
-  DEEPGRAM_SMART_FORMAT (optional, default: true)
-  DEEPGRAM_ENDPOINT (optional, default: https://api.deepgram.com/v1/listen)
-  DEBUG_ERRORS (optional, default: 0) -> adds extra debug logs
+- DEEPGRAM_API_KEY (required)
+Optional:
+- STT_TIMEOUT_SECS (default 45)
+- STT_MAX_BYTES (default 25_000_000)  # 25MB
+- STT_DEBUG (default 0)              # if "1", prints short debug info
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
-import logging
 import os
-from typing import Optional, Dict, Any
+import json
+import mimetypes
+from typing import Optional, Any, Dict, Tuple
 
-import anyio
-import requests
+import httpx
 
-logger = logging.getLogger("alina.stt")
-
-_FILE_VERSION = "stt_client.py@2026-01-17.v2"
-_THIS_FILE = os.path.abspath(__file__)
-
-
-def _bool_env(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+# -----------------------------
+# Config
+# -----------------------------
+DEEPGRAM_API_KEY = (os.getenv("DEEPGRAM_API_KEY") or "").strip()
+STT_TIMEOUT_SECS = float(os.getenv("STT_TIMEOUT_SECS", "45"))
+STT_MAX_BYTES = int(os.getenv("STT_MAX_BYTES", str(25_000_000)))
+STT_DEBUG = os.getenv("STT_DEBUG", "0") == "1"
 
 
-def _safe_sha1(data: bytes) -> str:
-    return hashlib.sha1(data).hexdigest()
+# -----------------------------
+# Helpers
+# -----------------------------
+def _dbg(msg: str) -> None:
+    if STT_DEBUG:
+        print(f"[stt_client] {msg}")
 
 
-def _lang_to_deepgram(lang: str) -> str:
-    # Deepgram expects ISO language codes like "en", "ru", "th".
-    # Keep conservative mapping.
-    lang = (lang or "ru").strip().lower()
-    if lang in ("ru", "rus", "ru-ru"):
+def _normalize_lang(lang: Optional[str]) -> str:
+    """
+    Map UI lang to Deepgram language codes.
+    UI sends: ru | en | th
+    Deepgram expects: ru | en | th (these are OK), but keep mapping explicit.
+    """
+    if not lang:
         return "ru"
-    if lang in ("en", "eng", "en-us", "en-gb"):
+    lang = lang.lower().strip()
+    if lang in ("ru", "ru-ru"):
+        return "ru"
+    if lang in ("en", "en-us", "en-gb"):
         return "en"
-    if lang in ("th", "tha", "th-th"):
+    if lang in ("th", "th-th"):
         return "th"
-    # fallback: pass through first two letters if plausible
-    return lang[:2] if len(lang) >= 2 else "en"
+    return lang
 
 
-def _guess_mimetype(filename: str, explicit: Optional[str]) -> str:
-    if explicit:
-        return explicit
-
-    fn = (filename or "").lower().strip()
-    if fn.endswith(".mp3"):
-        return "audio/mpeg"
-    if fn.endswith(".wav"):
-        return "audio/wav"
-    if fn.endswith(".m4a"):
-        return "audio/mp4"
-    if fn.endswith(".mp4"):
-        return "audio/mp4"
-    if fn.endswith(".webm"):
+def _guess_mimetype(filename: str, provided: Optional[str]) -> str:
+    if provided and "/" in provided:
+        return provided.split(";")[0].strip()
+    mt, _ = mimetypes.guess_type(filename)
+    if mt:
+        return mt
+    # common fallbacks
+    if filename.lower().endswith(".webm"):
         return "audio/webm"
-    if fn.endswith(".ogg"):
-        return "audio/ogg"
-    # default safe-ish
+    if filename.lower().endswith(".wav"):
+        return "audio/wav"
+    if filename.lower().endswith(".mp3"):
+        return "audio/mpeg"
+    if filename.lower().endswith(".m4a"):
+        return "audio/mp4"
     return "application/octet-stream"
 
 
-def _deepgram_request(
-    *,
-    audio_bytes: bytes,
-    filename: str,
-    lang: str,
-    mimetype: Optional[str],
-    request_id: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> str:
+def _pick_extension(filename: str, mimetype: str) -> str:
+    ext = os.path.splitext(filename)[1].lower()
+    if ext:
+        return ext
+    # reverse guess
+    if mimetype == "audio/webm":
+        return ".webm"
+    if mimetype in ("audio/wav", "audio/x-wav"):
+        return ".wav"
+    if mimetype in ("audio/mpeg", "audio/mp3"):
+        return ".mp3"
+    if mimetype in ("audio/mp4", "audio/m4a"):
+        return ".m4a"
+    return ".bin"
+
+
+def _deepgram_query_params(lang: str) -> Dict[str, Any]:
     """
-    Blocking call. Must be executed in a worker thread.
-    Returns transcript (string).
+    Reasonable defaults for general speech.
+    You can tune later (model, punctuation, diarize, etc.).
     """
-    api_key = (os.getenv("DEEPGRAM_API_KEY", "") or "").strip()
-    if not api_key:
-        raise RuntimeError("DEEPGRAM_API_KEY is not set")
-
-    endpoint = (os.getenv("DEEPGRAM_ENDPOINT", "") or "").strip() or "https://api.deepgram.com/v1/listen"
-    model = (os.getenv("DEEPGRAM_MODEL", "") or "").strip() or "nova-2"
-    tier = (os.getenv("DEEPGRAM_TIER", "") or "").strip() or "standard"
-
-    punctuate = _bool_env("DEEPGRAM_PUNCTUATE", True)
-    smart_format = _bool_env("DEEPGRAM_SMART_FORMAT", True)
-
-    dg_lang = _lang_to_deepgram(lang)
-    content_type = _guess_mimetype(filename, mimetype)
-
-    params = {
-        "model": model,
-        "tier": tier,
-        "language": dg_lang,
-        "punctuate": str(punctuate).lower(),
-        "smart_format": str(smart_format).lower(),
+    return {
+        "model": "nova-2",
+        "language": _normalize_lang(lang),
+        "smart_format": "true",
+        "punctuate": "true",
+        "profanity_filter": "false",
     }
 
-    headers = {
-        "Authorization": f"Token {api_key}",
-        "Content-Type": content_type,
-    }
 
-    # Log minimal safe diagnostics
-    audio_sha1 = _safe_sha1(audio_bytes[:200000])  # hash prefix only (privacy + perf)
-    logger.info(
-        "STT Deepgram request: request_id=%s file=%s bytes=%d mimetype=%s lang=%s dg_lang=%s model=%s tier=%s sha1(prefix)=%s version=%s path=%s",
-        request_id,
-        filename,
-        len(audio_bytes),
-        content_type,
-        lang,
-        dg_lang,
-        model,
-        tier,
-        audio_sha1,
-        _FILE_VERSION,
-        _THIS_FILE,
-    )
-
-    resp = requests.post(endpoint, params=params, headers=headers, data=audio_bytes, timeout=60)
-    if resp.status_code >= 400:
-        # Attempt to parse error JSON
-        try:
-            err_json = resp.json()
-        except Exception:
-            err_json = {"raw": resp.text[:500]}
-        raise RuntimeError(f"Deepgram STT failed: HTTP {resp.status_code}: {json.dumps(err_json, ensure_ascii=False)}")
-
-    data = resp.json()
-
-    # Deepgram typical response:
-    # data["results"]["channels"][0]["alternatives"][0]["transcript"]
-    transcript = ""
+def _parse_deepgram_transcript(payload: Dict[str, Any]) -> str:
+    """
+    Parse both SDK-like and REST-like response shapes.
+    Deepgram prerecorded typically returns:
+      results.channels[0].alternatives[0].transcript
+    """
     try:
-        transcript = (
-            data.get("results", {})
-                .get("channels", [{}])[0]
-                .get("alternatives", [{}])[0]
-                .get("transcript", "")
-        )
+        results = payload.get("results") or {}
+        channels = results.get("channels") or []
+        if not channels:
+            return ""
+        alts = (channels[0].get("alternatives") or [])
+        if not alts:
+            return ""
+        transcript = (alts[0].get("transcript") or "").strip()
+        return transcript
     except Exception:
-        transcript = ""
-
-    transcript = (transcript or "").strip()
-    if not transcript:
-        # Not fatal: return empty string, but log diagnostics
-        logger.warning("STT Deepgram returned empty transcript: request_id=%s file=%s", request_id, filename)
-
-    # Optional debug dump (never includes api_key)
-    if _bool_env("DEBUG_ERRORS", False):
-        logger.info("STT Deepgram response keys: request_id=%s keys=%s", request_id, list(data.keys()))
-
-    return transcript
+        return ""
 
 
+# -----------------------------
+# Public API
+# -----------------------------
 async def transcribe(
     audio_bytes: bytes,
     filename: str = "audio.wav",
-    lang: str = "ru",
+    lang: Optional[str] = None,
     mimetype: Optional[str] = None,
-    request_id: Optional[str] = None,
-    **kwargs,
+    language: Optional[str] = None,
+    **kwargs: Any,
 ) -> str:
     """
-    Async STT wrapper (НЕУБИВАЕМЫЙ):
-    - accepts lang/mimetype/request_id
-    - accepts **kwargs to survive contract drift
-    """
-    # Preserve extra debug context but do not enforce schema
-    extra = {}
-    if kwargs:
-        # Keep only JSON-serializable primitives for safe logging
-        for k, v in kwargs.items():
-            if isinstance(v, (str, int, float, bool)) or v is None:
-                extra[k] = v
-            else:
-                extra[k] = str(type(v))
-        if extra and _bool_env("DEBUG_ERRORS", False):
-            logger.info("STT transcribe got extra kwargs: request_id=%s extra=%s", request_id, extra)
+    Production-safe transcription.
 
-    # Run blocking request in threadpool
-    return await anyio.to_thread.run_sync(
-        _deepgram_request,
-        audio_bytes=audio_bytes,
-        filename=filename,
-        lang=lang,
-        mimetype=mimetype,
-        request_id=request_id,
-        extra=extra,
-    )
+    Compatibility:
+      - accepts lang=..., language=..., mimetype=...
+      - accepts extra kwargs and ignores them (prevents "unexpected keyword" crashes)
+
+    Returns:
+      transcript string (may be empty)
+    Raises:
+      RuntimeError with details (will appear in FastAPI 500 if you bubble it)
+    """
+    if not DEEPGRAM_API_KEY:
+        raise RuntimeError("DEEPGRAM_API_KEY is not set")
+
+    if not audio_bytes:
+        raise RuntimeError("Empty audio_bytes")
+
+    if len(audio_bytes) > STT_MAX_BYTES:
+        raise RuntimeError(f"Audio too large: {len(audio_bytes)} bytes > STT_MAX_BYTES={STT_MAX_BYTES}")
+
+    # allow caller to pass either lang or language
+    use_lang = language or lang or "ru"
+
+    mime = _guess_mimetype(filename, mimetype)
+    ext = _pick_extension(filename, mime)
+
+    _dbg(f"transcribe() len={len(audio_bytes)} filename={filename} mime={mime} lang={use_lang} ext={ext}")
+
+    # 1) Try Deepgram SDK (if installed and compatible)
+    sdk_err: Optional[Exception] = None
+    try:
+        # Deepgram SDK v3 style import
+        from deepgram import DeepgramClient, PrerecordedOptions  # type: ignore
+
+        client = DeepgramClient(DEEPGRAM_API_KEY)
+
+        options_dict = _deepgram_query_params(use_lang)
+
+        # SDK expects booleans not strings sometimes
+        options = PrerecordedOptions(
+            model=options_dict["model"],
+            language=options_dict["language"],
+            smart_format=True,
+            punctuate=True,
+            profanity_filter=False,
+        )
+
+        # Deepgram SDK accepts "buffer" source
+        source = {"buffer": audio_bytes, "mimetype": mime}
+
+        # v3 has: client.listen.prerecorded.v("1").transcribe_file(source, options)
+        # But different minor versions vary. We'll try common signatures.
+        dg_resp = None
+        try:
+            dg_resp = await client.listen.prerecorded.v("1").transcribe_file(source, options)  # type: ignore
+        except TypeError:
+            # fallback: sync call
+            dg_resp = client.listen.prerecorded.v("1").transcribe_file(source, options)  # type: ignore
+
+        # response can be object with .to_dict()
+        if hasattr(dg_resp, "to_dict"):
+            payload = dg_resp.to_dict()  # type: ignore
+        elif isinstance(dg_resp, dict):
+            payload = dg_resp
+        else:
+            # last resort
+            payload = json.loads(str(dg_resp))
+
+        transcript = _parse_deepgram_transcript(payload)
+        if transcript:
+            return transcript
+
+        # If empty, still return empty (no exception)
+        return transcript
+
+    except Exception as e:
+        sdk_err = e
+        _dbg(f"Deepgram SDK failed, fallback to REST. Error: {repr(e)}")
+
+    # 2) REST fallback (robust)
+    url = "https://api.deepgram.com/v1/listen"
+    params = _deepgram_query_params(use_lang)
+
+    headers = {
+        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+        "Content-Type": mime,
+    }
+
+    timeout = httpx.Timeout(STT_TIMEOUT_SECS, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            resp = await client.post(url, params=params, content=audio_bytes, headers=headers)
+        except Exception as e:
+            # include sdk error too
+            raise RuntimeError(f"Deepgram REST request failed: {e}. SDK error was: {repr(sdk_err)}") from e
+
+    if resp.status_code >= 400:
+        # return a short body snippet for debugging
+        body_snip = resp.text[:600]
+        raise RuntimeError(
+            f"Deepgram REST error {resp.status_code}: {body_snip}. SDK error was: {repr(sdk_err)}"
+        )
+
+    try:
+        payload = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"Deepgram REST returned non-JSON: {resp.text[:600]}") from e
+
+    transcript = _parse_deepgram_transcript(payload)
+    return transcript.strip()
